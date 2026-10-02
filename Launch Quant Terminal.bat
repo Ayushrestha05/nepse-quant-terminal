@@ -27,9 +27,10 @@ echo.
 if not "%STATUS%"=="0" (
     echo NEPSE Quant Terminal exited with status %STATUS%.
     echo Read the message above, fix the issue, then launch again.
+    echo.
+    pause
+    exit /b %STATUS%
 ) else (
-    echo NEPSE Quant Terminal closed.
+    echo NEPSE Quant desktop dashboard launched.
 )
-echo.
-pause
-exit /b %STATUS%
+exit /b 0

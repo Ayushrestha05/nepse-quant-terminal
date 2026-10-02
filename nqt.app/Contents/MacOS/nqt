@@ -1,5 +1,5 @@
 #!/bin/sh
-# NQT launcher — opens the NEPSE Quant Terminal TUI in a new Terminal window.
+# NQT launcher — opens the NEPSE Quant desktop dashboard without a Terminal window.
 # Works whether this .app lives inside the repo or anywhere else (Desktop,
 # /Applications, …): it tries its own location first, then a known repo path.
 set -u
@@ -23,11 +23,15 @@ fi
 
 # Escape the path for safe embedding in the AppleScript string.
 escaped_repo=$(printf '%s' "$REPO_ROOT" | sed 's/\\/\\\\/g; s/"/\\"/g')
+LOG_FILE="$REPO_ROOT/data/runtime/logs/desktop-launch.log"
+escaped_log=$(printf '%s' "$LOG_FILE" | sed 's/\\/\\\\/g; s/"/\\"/g')
 
 osascript <<APPLESCRIPT
 set repoPath to "$escaped_repo"
-tell application "Terminal"
-    activate
-    do script "cd " & quoted form of repoPath & " && sh " & quoted form of (repoPath & "/Launch Quant Terminal.command")
-end tell
+set logPath to "$escaped_log"
+try
+    do shell script "cd " & quoted form of repoPath & " && mkdir -p data/runtime/logs && NEPSE_NO_PAUSE=1 sh " & quoted form of (repoPath & "/Launch Quant Terminal.command") & " > " & quoted form of logPath & " 2>&1"
+on error errorText
+    display dialog "NEPSE Quant could not launch. See " & logPath & return & return & errorText buttons {"OK"} default button "OK" with title "NEPSE Quant"
+end try
 APPLESCRIPT

@@ -9,7 +9,7 @@ Double-click:
 - `Nepse Quant Terminal.app`, or
 - `Launch Quant Terminal.command`
 
-The launcher opens Terminal, creates `.venv` if needed, installs `requirements.txt`, downloads the bundled market database if missing, runs preflight, then starts the TUI.
+The launcher creates `.venv` if needed, installs `requirements.txt`, downloads the bundled market database if missing, runs preflight, then opens the desktop GUI. The macOS app bundle launches it without opening a Terminal window; the `.command` script itself still runs in Terminal.
 
 Keep `Nepse Quant Terminal.app` inside the repo folder. It is a lightweight launcher that uses the files beside it; do not drag it into `/Applications` by itself.
 
@@ -27,7 +27,7 @@ Double-click:
 
 - `Launch Quant Terminal.bat`
 
-The launcher creates `.venv`, installs dependencies, downloads the bundled market database if missing, runs preflight, then starts the TUI.
+The launcher creates `.venv`, installs dependencies, downloads the bundled market database if missing, runs preflight, then opens the desktop GUI. Install the Tk package that matches your Python if the launcher reports that Tkinter is unavailable (for example, `python3-tk` on Debian or Ubuntu).
 
 Python 3.12 is recommended. During Python install, select **Add python.exe to PATH**.
 
@@ -45,4 +45,5 @@ These are local machine files and should not be committed.
 
 - If dependency installation fails, install Git and launch again. The NEPSE package is installed from GitHub.
 - If the dashboard opens but data is stale, run `python setup_data.py --scrape --days 90` from the activated environment or use the normal scraper workflow.
-- If the terminal closes immediately, run the `.command` or `.bat` launcher directly so the error remains visible.
+- If setup fails, run the `.command` or `.bat` launcher directly so its error remains visible.
+- To use the optional Textual interface, run `python scripts/launch/bootstrap.py --tui` from the repository folder.

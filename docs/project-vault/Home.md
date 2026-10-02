@@ -11,6 +11,7 @@ This vault records the purpose and reasoning behind each project change. Git rec
 
 ## Change notes
 
+- [[2026-10-02-desktop-gui|Compact cross-platform desktop GUI]]
 - [[2026-10-02-model-research|Open-source walk-forward model research]]
 - [[2026-10-02-project-vault|Project change tracking vault]]
 

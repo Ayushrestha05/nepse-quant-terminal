@@ -1,8 +1,8 @@
-# NEPSE Quant Terminal
+# NEPSE Quant
 
-A terminal-based quantitative trading dashboard for the Nepal Stock Exchange (NEPSE), built with [Textual](https://textual.textualize.io/). Runs entirely in your terminal — no browser, no electron, no cloud dependency.
+A compact cross-platform desktop research and paper-trading dashboard for the Nepal Stock Exchange (NEPSE), built with Python's native Tk interface. The Textual terminal interface remains available as an optional fallback; no browser or Electron runtime is required.
 
-**Paper trading only.** This terminal simulates trades locally. It does not connect to any broker API.
+**Paper trading only.** The app simulates trades locally. It does not connect to any broker API.
 
 > ⚠️ **Disclaimer — read this first.** This is an **educational research tool, not financial advice.** It does not connect to a broker and cannot place real orders. The bundled backtest figures are **in-sample / historical** — they come from a parameter sweep, are **not** corrected for the number of strategy variants tried, and the repo ships **no artifact that reproduces them as forward-tested returns.** Treat them as a demonstration of the tooling, not as proof of an edge. Past performance does not indicate future results. Nothing here is a recommendation to buy or sell any security. See [docs/VALIDATION_METHODOLOGY.md](docs/VALIDATION_METHODOLOGY.md).
 
@@ -13,6 +13,7 @@ A terminal-based quantitative trading dashboard for the Nepal Stock Exchange (NE
 - **Paper Trading** — full paper portfolio with buy/sell order book, P&L tracking, NAV history, and multi-account support. Seed from your MeroShare holdings CSV or start blank.
 - **Auto Trading Engine** — assigns a quantitative strategy to each account. The engine runs in the background, generates signals every 5 trading days, and manages entries/exits automatically (holding periods, stop losses, trailing stops, regime filters).
 - **Backtesting** — backtests on 6+ years of NEPSE price data, with a walk-forward replay harness and a statistical validation suite. The bundled C5 baseline shows a *historical, in-sample* +88% return (Sharpe ~2.2) vs. NEPSE +27% — a figure from a parameter sweep, **not corrected for multiple testing and not a forward-performance claim** (the repo ships no artifact reproducing it). Run the validation suite (deflated Sharpe, random-baseline percentile, CSCV/PBO) to see how it holds up; see [docs/VALIDATION_METHODOLOGY.md](docs/VALIDATION_METHODOLOGY.md).
+- **Model Research** — compare the existing signal ranking with an open-source scikit-learn ranker using rolling 504-day training and 63-day out-of-sample windows, NEPSE fees, and adjustable slippage. Research scores do not affect paper accounts.
 - **Market Dashboard** — live quotes, 52-week highs/lows, top movers, sector heatmap, volume signals.
 - **Portfolio Analytics** — unrealized/realized P&L, sector concentration, holding age buckets, max drawdown, alpha vs. NEPSE benchmark.
 - **Gold Hedge Overlay** — tracks gold/silver regime (risk-on / neutral / risk-off) and adjusts capital deployment accordingly.
@@ -34,8 +35,8 @@ The public agent workflow is evidence-gated, checkpointed, and restricted to pap
 
 ```
 ┌─────────────────────────────────────────────────────┐
-│                   Textual TUI                       │
-│  dashboard_tui.py  ·  9 tabs  ·  keyboard-driven    │
+│                Tk desktop dashboard                  │
+│   apps/desktop/dashboard.py · lazy 11-view UI        │
 └──────────┬──────────────────────┬───────────────────┘
            │                      │
     ┌──────▼──────┐      ┌────────▼────────┐
@@ -58,7 +59,8 @@ The public agent workflow is evidence-gated, checkpointed, and restricted to pap
 
 | Component | File | What it does |
 |---|---|---|
-| TUI | `apps/tui/dashboard_tui.py` | All UI — 9 tabs, keyboard shortcuts, paper order book |
+| Desktop GUI | `apps/desktop/dashboard.py` | Compact Tk interface; loads the selected view on demand |
+| Optional TUI | `apps/tui/dashboard_tui.py` | Textual terminal interface and paper order book |
 | Trading Engine | `backend/trading/tui_trading_engine.py` | Per-account auto-trading loop, regime filter, stop logic |
 | Paper Trader | `backend/trading/paper_trader.py` | Manual buy/sell execution, portfolio persistence |
 | Signal Engine | `backend/backtesting/simple_backtest.py` | All signal generation and backtest runner |
@@ -237,7 +239,7 @@ After downloading or cloning the repo, use the double-click launcher for your OS
 - macOS: `Nepse Quant Terminal.app` or `Launch Quant Terminal.command`
 - Windows: `Launch Quant Terminal.bat`
 
-The launcher creates `.venv`, installs dependencies, downloads the bundled market database if missing, runs preflight, and starts the TUI.
+The launcher creates `.venv`, installs dependencies, downloads the bundled market database if missing, runs preflight, and opens the desktop GUI. On Windows, the GUI runs without leaving a console window open. The optional TUI can be launched with `python scripts/launch/bootstrap.py --tui`.
 
 See [`docs/EASY_LAUNCH.md`](docs/EASY_LAUNCH.md) for troubleshooting notes and macOS security prompt handling.
 

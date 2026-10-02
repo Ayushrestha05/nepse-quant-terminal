@@ -25,7 +25,10 @@ if [ "$STATUS" -ne 0 ]; then
     echo "NEPSE Quant Terminal exited with status $STATUS."
     echo "Read the message above, fix the issue, then launch again."
 else
-    echo "NEPSE Quant Terminal closed."
+    echo "NEPSE Quant desktop dashboard closed."
+fi
+if [ "${NEPSE_NO_PAUSE:-0}" = "1" ]; then
+    exit "$STATUS"
 fi
 echo
 printf "Press Enter to close this window..."

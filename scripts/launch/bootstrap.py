@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Create/update the local environment and launch the Textual dashboard."""
+"""Create/update the local environment and launch the desktop dashboard."""
 from __future__ import annotations
 
 import hashlib
+import argparse
 import os
 import platform
 import subprocess
@@ -110,21 +111,47 @@ def run_preflight(root: Path, python: Path) -> None:
         raise SystemExit(exc.returncode) from exc
 
 
-def launch_tui(root: Path, python: Path) -> int:
+def launch_dashboard(root: Path, python: Path, *, terminal: bool = False) -> int:
     env = os.environ.copy()
     env.setdefault("PYTHONUTF8", "1")
     env.setdefault("PYTHONIOENCODING", "utf-8")
     env.setdefault("NEPSE_LAUNCHED_FROM_HELPER", platform.system())
-    print("\nLaunching NEPSE Quant Terminal...\n")
-    return subprocess.run(
-        [str(python), "-m", "apps.tui.dashboard_tui"],
-        cwd=str(root),
-        env=env,
-        check=False,
-    ).returncode
+    module = "apps.tui.dashboard_tui" if terminal else "apps.desktop.dashboard"
+    if not terminal:
+        probe = subprocess.run(
+            [str(python), "-c", "import tkinter; print(tkinter.TkVersion)"],
+            cwd=str(root),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if probe.returncode:
+            hint = "Install the matching Tk package (for example, python3-tk on Debian/Ubuntu) and launch again."
+            raise SystemExit(f"Tkinter is unavailable in {python}. {hint}\n{probe.stderr.strip()}")
+    label = "Textual terminal" if terminal else "desktop dashboard"
+    print(f"\nLaunching NEPSE Quant {label}...\n")
+    command = [str(python), "-m", module]
+    if os.name == "nt" and not terminal:
+        log = root / "data" / "runtime" / "logs" / "desktop-launch.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        with log.open("a", encoding="utf-8") as output:
+            subprocess.Popen(
+                command,
+                cwd=str(root),
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=output,
+                stderr=subprocess.STDOUT,
+                creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NO_WINDOW,
+            )
+        return 0
+    return subprocess.run(command, cwd=str(root), env=env, check=False).returncode
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description="Launch NEPSE Quant")
+    parser.add_argument("--tui", action="store_true", help="launch the optional terminal interface")
+    args = parser.parse_args()
     root = repo_root()
     os.chdir(root)
     ensure_supported_python()
@@ -132,7 +159,7 @@ def main() -> int:
     ensure_requirements(root, python)
     ensure_database(root, python)
     run_preflight(root, python)
-    return launch_tui(root, python)
+    return launch_dashboard(root, python, terminal=args.tui)
 
 
 if __name__ == "__main__":

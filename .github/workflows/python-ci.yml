@@ -23,6 +23,12 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
+      - name: Install Tk and virtual display
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tk xvfb
+
       - name: Install dependencies
         run: |
           python -m pip install -U pip
@@ -30,3 +36,11 @@ jobs:
 
       - name: Run unit tests
         run: python -m pytest tests/unit -q
+
+      - name: Smoke test desktop views
+        if: runner.os == 'Linux'
+        run: xvfb-run -a python -m apps.desktop.dashboard --smoke
+
+      - name: Smoke test desktop views
+        if: runner.os != 'Linux'
+        run: python -m apps.desktop.dashboard --smoke
