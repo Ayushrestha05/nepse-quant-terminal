@@ -26,10 +26,17 @@ def test_legacy_sun_thu_override(monkeypatch):
     import backend.quant_pro.nepse_calendar as calendar
 
     importlib.reload(calendar)
-
     assert calendar.get_market_schedule()["trading_week"] == "Sunday-Thursday"
     assert calendar.is_trading_day(date(2026, 4, 10)) is False  # Friday
     assert calendar.is_trading_day(date(2026, 4, 12)) is True  # Sunday
 
     monkeypatch.delenv("NEPSE_TRADING_WEEK", raising=False)
     importlib.reload(calendar)
+
+
+def test_latest_completed_session_changes_at_1600_and_skips_non_trading_days():
+    from backend.quant_pro.nepse_calendar import latest_completed_session
+
+    assert latest_completed_session(datetime(2026, 4, 10, 15, 59)) == date(2026, 4, 9)
+    assert latest_completed_session(datetime(2026, 4, 10, 16, 0)) == date(2026, 4, 10)
+    assert latest_completed_session(datetime(2026, 4, 11, 9, 0)) == date(2026, 4, 10)

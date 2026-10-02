@@ -149,6 +149,12 @@ def test_tui_trading_engine_autopilot_writes_canonical_account_ledger(tmp_path, 
         strategy_config={"id": "s1"},
         on_activity=events.append,
     )
+    engine._prices_df = pd.DataFrame([
+        {"symbol": "NABIL", "date": pd.Timestamp("2026-04-08"), "close": 100},
+        {"symbol": "NEPSE", "date": pd.Timestamp("2026-04-08"), "close": 2700},
+    ])
+    engine._fresh_quote_symbols = lambda symbols: set(symbols)
+    monkeypatch.setattr("backend.trading.tui_trading_engine.open_issue_symbols", lambda _operation: set())
 
     engine._active_run_id = "run-1"
     engine._execute_buys([{"symbol": "NABIL", "signal_type": "volume", "agent_reason": "", "score": 0.9}])

@@ -21,6 +21,7 @@ import logging
 import math
 import multiprocessing
 import sqlite3
+import threading
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -439,6 +440,54 @@ def load_all_prices(conn: sqlite3.Connection) -> pd.DataFrame:
     df = pd.read_sql_query(query, conn)
     df["date"] = pd.to_datetime(df["date"])
     return df
+
+
+_shared_price_lock = threading.RLock()
+_shared_price_path: str | None = None
+_shared_price_frame: pd.DataFrame | None = None
+
+
+def load_shared_price_history(db_path: str | Path | None = None) -> pd.DataFrame:
+    """Return the process-wide immutable-by-convention history snapshot."""
+    global _shared_price_path, _shared_price_frame
+    path = str(Path(db_path or get_db_path()).resolve())
+    with _shared_price_lock:
+        if _shared_price_frame is not None and _shared_price_path == path:
+            return _shared_price_frame
+        conn = sqlite3.connect(path)
+        try:
+            frame = load_all_prices(conn)
+        finally:
+            conn.close()
+        _shared_price_path, _shared_price_frame = path, frame
+        return frame
+
+
+def refresh_shared_price_history(
+    symbols: List[str] | set[str] | tuple[str, ...], db_path: str | Path | None = None
+) -> pd.DataFrame:
+    """Atomically replace just the changed symbols after a SQLite update."""
+    global _shared_price_path, _shared_price_frame
+    clean = sorted({str(symbol).strip().upper() for symbol in symbols if str(symbol).strip()})
+    path = str(Path(db_path or get_db_path()).resolve())
+    with _shared_price_lock:
+        if _shared_price_frame is None or _shared_price_path != path or not clean:
+            return load_shared_price_history(path)
+        placeholders = ",".join("?" for _ in clean)
+        conn = sqlite3.connect(path)
+        try:
+            fresh = pd.read_sql_query(
+                f"SELECT symbol,date,open,high,low,close,volume FROM stock_prices WHERE symbol IN ({placeholders}) ORDER BY symbol,date",
+                conn, params=clean,
+            )
+        finally:
+            conn.close()
+        fresh["date"] = pd.to_datetime(fresh["date"])
+        keep = _shared_price_frame[~_shared_price_frame["symbol"].isin(clean)]
+        _shared_price_frame = pd.concat((keep, fresh), ignore_index=True).sort_values(
+            ["symbol", "date"], ignore_index=True
+        )
+        return _shared_price_frame
 
 
 def precompute_prev_close(prices_df: pd.DataFrame) -> pd.DataFrame:

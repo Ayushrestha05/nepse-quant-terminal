@@ -11,7 +11,7 @@ from typing import Dict, Iterable, Optional
 import pandas as pd
 import requests
 from requests.exceptions import HTTPError, RequestException, Timeout
-from tenacity import before_sleep_log, retry, retry_if_exception_type, stop_after_attempt, wait_exponential
+from tenacity import before_sleep_log, retry, retry_if_exception, retry_if_exception_type, stop_after_attempt, wait_exponential
 import logging
 
 from .realtime_market import get_market_data_provider
@@ -46,10 +46,19 @@ class _RateLimiter:
 _rate_limiter = _RateLimiter(rate=0.5)
 
 
+def _retry_provider_error(exc: BaseException) -> bool:
+    """Do not multiply provider-wide rate limits into a burst of retries."""
+    response = getattr(exc, "response", None)
+    return (
+        getattr(response, "status_code", None) != 429
+        and isinstance(exc, (RequestException, Timeout, HTTPError, ValueError))
+    )
+
+
 @retry(
     stop=stop_after_attempt(5),
     wait=wait_exponential(multiplier=1, min=2, max=60),
-    retry=retry_if_exception_type((RequestException, Timeout, HTTPError, ValueError)),
+    retry=retry_if_exception(_retry_provider_error),
     before_sleep=before_sleep_log(logger, logging.WARNING),
     reraise=True,
 )

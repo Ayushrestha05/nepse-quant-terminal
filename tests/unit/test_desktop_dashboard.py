@@ -99,3 +99,29 @@ def test_rates_report_optional_source_failures_when_kalimati_succeeds(monkeypatc
 
     assert result["status"] == "Kalimati updated · 1 market rates · 1 sources unavailable"
     assert "Gold and silver: timeout" in result["detail"]
+
+
+def test_daily_scheduler_separates_recent_bars_from_manual_history_gaps(tmp_path):
+    db_path = tmp_path / "market.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute("CREATE TABLE market_quotes (symbol TEXT,fetched_at_utc TEXT)")
+    conn.execute("CREATE TABLE stock_prices (symbol TEXT,date TEXT)")
+    conn.executemany("INSERT INTO market_quotes VALUES (?, '2026-10-02T06:00:00+00:00')", [(s,) for s in ("AAA", "BBB", "CCC")])
+    conn.executemany("INSERT INTO stock_prices VALUES (?,?)", [
+        ("NEPSE", "2026-10-01"), ("AAA", "2026-10-01"),
+        ("BBB", "2026-09-28"), ("CCC", "2026-09-01"),
+    ])
+    conn.commit()
+    conn.close()
+
+    due, old = DesktopDashboard._daily_history_symbols(SimpleNamespace(_db_path=lambda: db_path), "2026-10-02")
+
+    assert due == ["AAA", "BBB", "NEPSE"]
+    assert old == [("CCC", "2026-09-01")]
+
+    missing = DesktopDashboard._record_scheduled_history_gaps(db_path, ["BBB"], "2026-10-02")
+    due_after_attempt, _old_after_attempt = DesktopDashboard._daily_history_symbols(
+        SimpleNamespace(_db_path=lambda: db_path), "2026-10-02"
+    )
+    assert missing == ["BBB"]
+    assert "BBB" not in due_after_attempt

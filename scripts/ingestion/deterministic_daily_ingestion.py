@@ -34,6 +34,14 @@ from backend.quant_pro.database import (
     save_to_db,
 )
 from backend.quant_pro.data_io import resync_full_history
+from backend.quant_pro.data_fetch_issues import (
+    classify_fetch_error,
+    ensure_issue_schema,
+    is_rate_limited,
+    record_issue,
+    resolve_issues,
+    retry_after_from_error,
+)
 from backend.quant_pro.institutional import (
     INGESTION_RUN_STATUS,
     INGESTION_SYMBOL_STATUS,
@@ -322,6 +330,7 @@ def execute_ingestion(
     signal.signal(signal.SIGINT, _handle_shutdown)
     signal.signal(signal.SIGTERM, _handle_shutdown)
 
+    ensure_issue_schema(conn)
     latest_before = get_db_latest_market_date(conn)
     run_id = start_run(
         conn,
@@ -341,6 +350,8 @@ def execute_ingestion(
     failed = 0
     rows_fetched_total = 0
     resyncs_done = 0
+    rate_limited = False
+    retry_after = None
 
     # Drain symbols queued for full re-sync by a prior run (re-based but not yet
     # rewritten). These count against the same cap as in-loop detections.
@@ -356,11 +367,43 @@ def execute_ingestion(
                 print(f"[ingestion] drained pending re-sync for {pending}")
         except Exception as exc:  # isolate drain failures
             print(f"[ingestion] pending re-sync failed for {pending}: {exc}")
+            if is_rate_limited(exc):
+                rate_limited = True
+                retry_after = retry_after_from_error(exc)
+                record_issue(
+                    "merolagani", "history", "RATE_LIMITED", str(exc), symbol=pending,
+                    retry_after_utc=retry_after, run_id=run_id, conn=conn,
+                )
+                break
 
     for idx, symbol in enumerate(symbols, start=1):
+        if rate_limited:
+            for deferred in symbols[idx - 1:]:
+                record_issue(
+                    "merolagani", "history", "RATE_LIMITED",
+                    f"Deferred after provider rate limit; retry after {retry_after or 'cooldown'}.",
+                    symbol=deferred, retry_after_utc=retry_after, run_id=run_id, conn=conn,
+                    attempts=0,
+                )
+                latest = get_symbol_latest_date(conn, deferred)
+                save_symbol_result(conn, run_id, SymbolResult(
+                    deferred, "FAILED", 0, 0, latest, latest, "deferred_after_rate_limit",
+                ))
+                failed += 1
+            break
         if cancel_file is not None and cancel_file.exists():
             _shutdown_requested = True
             print(f"[ingestion] Graceful shutdown before {idx}/{len(symbols)} symbols")
+            for deferred in symbols[idx - 1:]:
+                record_issue(
+                    "merolagani", "history", "CANCELLED", "Deferred after the user cancelled this history run.",
+                    symbol=deferred, conn=conn, attempts=0,
+                )
+                save_symbol_result(conn, run_id, SymbolResult(
+                    deferred, "FAILED", 0, 0, get_symbol_latest_date(conn, deferred),
+                    get_symbol_latest_date(conn, deferred), "cancelled_before_fetch",
+                ))
+                failed += 1
             break
         latest_symbol_before = get_symbol_latest_date(conn, symbol)
         rows_before = get_symbol_row_count(conn, symbol)
@@ -386,8 +429,14 @@ def execute_ingestion(
                         if resyncs_done < max_full_resyncs and resync_full_history(symbol):
                             resyncs_done += 1
                             rows_fetched_total += get_symbol_row_count(conn, symbol)
+                            resolve_issues("merolagani", "history", symbols=[symbol], conn=conn)
                         else:
                             register_pending_resync(symbol)
+                            record_issue(
+                                "merolagani", "history", "VENDOR_REBASE",
+                                "Provider changed previously stored prices; full history resync is pending.",
+                                symbol=symbol, run_id=run_id, conn=conn,
+                            )
                             rebase_pending = True
 
             rows_after = get_symbol_row_count(conn, symbol)
@@ -418,10 +467,22 @@ def execute_ingestion(
                 if _shutdown_requested:
                     print(f"[ingestion] Graceful shutdown after {idx}/{len(symbols)} symbols")
                     status = "PARTIAL"
+                    for deferred in symbols[idx:]:
+                        latest = get_symbol_latest_date(conn, deferred)
+                        record_issue(
+                            "merolagani", "history", "CANCELLED", "Deferred after the user cancelled this history run.",
+                            symbol=deferred, conn=conn, attempts=0,
+                        )
+                        save_symbol_result(conn, run_id, SymbolResult(
+                            deferred, "FAILED", 0, 0, latest, latest, "cancelled_before_fetch",
+                        ))
+                        failed += 1
                     break
                 continue
 
             status = "SUCCESS" if rows_fetched > 0 else "NO_DATA"
+            if rows_fetched > 0:
+                resolve_issues("merolagani", "history", symbols=[symbol], conn=conn)
             save_symbol_result(
                 conn,
                 run_id,
@@ -442,6 +503,13 @@ def execute_ingestion(
             )
         except Exception as exc:  # keep run deterministic; isolate symbol failures
             failed += 1
+            category = classify_fetch_error(exc)
+            rate_limited = is_rate_limited(exc)
+            retry_after = retry_after_from_error(exc)
+            record_issue(
+                "merolagani", "history", category, str(exc), symbol=symbol,
+                retry_after_utc=retry_after, run_id=run_id, conn=conn,
+            )
             save_symbol_result(
                 conn,
                 run_id,
@@ -457,6 +525,22 @@ def execute_ingestion(
             )
             print(f"[{idx:04d}/{len(symbols):04d}] {symbol:<12} status=FAILED  error={exc}")
 
+            if rate_limited:
+                # A 429 is provider-wide: stop requests and persist the unvisited tail.
+                for deferred in symbols[idx:]:
+                    record_issue(
+                        "merolagani", "history", "RATE_LIMITED",
+                        f"Deferred after provider rate limit; retry after {retry_after or 'cooldown'}.",
+                        symbol=deferred, retry_after_utc=retry_after, run_id=run_id, conn=conn,
+                        attempts=0,
+                    )
+                    latest = get_symbol_latest_date(conn, deferred)
+                    save_symbol_result(conn, run_id, SymbolResult(
+                        deferred, "FAILED", 0, 0, latest, latest, "deferred_after_rate_limit",
+                    ))
+                    failed += 1
+                break
+
         if sleep_ms > 0:
             time.sleep(sleep_ms / 1000.0)
 
@@ -465,6 +549,16 @@ def execute_ingestion(
         if _shutdown_requested:
             print(f"[ingestion] Graceful shutdown after {idx}/{len(symbols)} symbols")
             status = "PARTIAL"
+            for deferred in symbols[idx:]:
+                latest = get_symbol_latest_date(conn, deferred)
+                record_issue(
+                    "merolagani", "history", "CANCELLED", "Deferred after the user cancelled this history run.",
+                    symbol=deferred, conn=conn, attempts=0,
+                )
+                save_symbol_result(conn, run_id, SymbolResult(
+                    deferred, "FAILED", 0, 0, latest, latest, "cancelled_before_fetch",
+                ))
+                failed += 1
             break
 
     latest_after = get_db_latest_market_date(conn)
@@ -472,7 +566,7 @@ def execute_ingestion(
     if latest_after is not None:
         freshness_days = (datetime.now().date() - pd.Timestamp(latest_after).date()).days
 
-    if _shutdown_requested:
+    if _shutdown_requested or rate_limited:
         status = "PARTIAL"
     elif failed == 0 and freshness_days is not None and freshness_days <= max_staleness_days:
         status = "SUCCESS"

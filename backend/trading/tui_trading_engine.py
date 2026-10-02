@@ -9,7 +9,6 @@ from __future__ import annotations
 import json
 import logging
 import shutil
-import sqlite3
 import time
 import uuid
 from datetime import datetime, timedelta
@@ -44,9 +43,10 @@ from backend.quant_pro.config import (
     TRAILING_STOP_PCT,
 )
 from backend.quant_pro.database import get_db_path
-from backend.quant_pro.nepse_calendar import is_trading_day
+from backend.quant_pro.data_fetch_issues import open_issue_symbols
+from backend.quant_pro.nepse_calendar import is_trading_day, latest_completed_session
 from backend.quant_pro.signal_ranking import blocked_signal_symbol_reason, canonicalize_signal_symbol
-from backend.backtesting.simple_backtest import get_symbol_sector, load_all_prices
+from backend.backtesting.simple_backtest import get_symbol_sector, load_shared_price_history
 from backend.trading.paper_execution import PaperExecutionService
 from validation.transaction_costs import TransactionCostModel as NepseFees
 
@@ -349,9 +349,7 @@ class TUITradingEngine:
 
         # Load price data once
         try:
-            conn = sqlite3.connect(str(get_db_path()))
-            self._prices_df = load_all_prices(conn)
-            conn.close()
+            self._prices_df = load_shared_price_history(get_db_path())
             self._log(f"Price data loaded: {len(self._prices_df)} rows")
         except Exception as e:
             self._log(f"ERROR loading prices: {e}")
@@ -440,12 +438,34 @@ class TUITradingEngine:
         self._log(f"Generating signals... types={self.signal_types}")
 
         try:
+            self._prices_df = load_shared_price_history(get_db_path())
+            data_ready, data_reason = self._buy_data_readiness()
             signals, regime = generate_signals(
                 self._prices_df,
                 self.signal_types,
                 use_regime_filter=True,
             )
             self.regime = regime
+            if not data_ready:
+                self._log(f"BUY PAUSED: {data_reason}")
+                signals = []
+            else:
+                latest_by_symbol = (
+                    self._prices_df.groupby("symbol")["date"].max().to_dict()
+                    if self._prices_df is not None and not self._prices_df.empty else {}
+                )
+                expected = latest_completed_session(now_nst()).isoformat()
+                unresolved = open_issue_symbols("history")
+                fresh_signals = []
+                for sig in signals:
+                    symbol = canonicalize_signal_symbol(sig.get("symbol"))
+                    observed = latest_by_symbol.get(symbol)
+                    observed_date = observed.strftime("%Y-%m-%d") if observed is not None else ""
+                    if symbol in unresolved or observed_date != expected:
+                        self._log(f"BUY PAUSED {symbol}: completed-session data is stale or has an unresolved issue")
+                        continue
+                    fresh_signals.append(sig)
+                signals = fresh_signals
             blocked = [
                 sig for sig in signals
                 if blocked_signal_symbol_reason(sig.get("symbol"))
@@ -476,6 +496,26 @@ class TUITradingEngine:
             self._log(f"Signal generation failed: {e}")
             self.signals_today = []
             self.regime = "unknown"
+
+    def _buy_data_readiness(self) -> tuple[bool, str]:
+        if self._prices_df is None or self._prices_df.empty:
+            return False, "local price history is empty"
+        expected = latest_completed_session(now_nst()).isoformat()
+        benchmark = self._prices_df[self._prices_df["symbol"].astype(str).str.upper() == "NEPSE"]
+        latest = benchmark["date"].max() if not benchmark.empty else None
+        latest_date = latest.strftime("%Y-%m-%d") if latest is not None else None
+        if latest_date != expected:
+            return False, f"NEPSE completed bar is {latest_date or 'missing'}; expected {expected}"
+        if "NEPSE" in open_issue_symbols("history"):
+            return False, "NEPSE has an unresolved historical-data issue"
+        return True, "ready"
+
+    @staticmethod
+    def _fresh_quote_symbols(symbols: List[str]) -> set[str]:
+        from backend.quant_pro.realtime_market import get_market_data_provider, quote_is_fresh
+
+        info = get_market_data_provider().get_last_batch_info()
+        return {symbol for symbol in symbols if quote_is_fresh(symbol, info)}
 
     # ─── Agent filter ───────────────────────────────────────────────────────
 
@@ -513,8 +553,13 @@ class TUITradingEngine:
         candidate_syms = [s["symbol"] for s in tradeable_signals if s["symbol"] not in self.positions]
         if not candidate_syms:
             return
+        ready, reason = self._buy_data_readiness()
+        if not ready:
+            self._log(f"BUY PAUSED: {reason}")
+            return
 
         ltps = fetch_prices_for_symbols(candidate_syms)
+        fresh_quotes = self._fresh_quote_symbols(candidate_syms)
         today_str = now_nst().strftime("%Y-%m-%d")
         per_position = self._compute_deployable_capital() / self.max_positions
         bought = 0
@@ -530,6 +575,9 @@ class TUITradingEngine:
             ltp = ltps.get(sym)
             if not ltp or ltp <= 0:
                 self._log(f"SKIP {sym}: no LTP available")
+                continue
+            if sym not in fresh_quotes:
+                self._log(f"SKIP {sym}: quote is missing or older than 120 seconds")
                 continue
 
             # Sector concentration check
@@ -611,10 +659,11 @@ class TUITradingEngine:
 
         symbols = list(self.positions.keys())
         ltps = fetch_prices_for_symbols(symbols)
+        fresh_quotes = self._fresh_quote_symbols(symbols)
 
         # Update positions with new prices
         for sym, ltp in ltps.items():
-            if ltp and sym in self.positions:
+            if ltp and sym in self.positions and sym in fresh_quotes:
                 pos = self.positions[sym]
                 pos.last_ltp = ltp
                 if ltp > pos.high_watermark:
@@ -633,6 +682,9 @@ class TUITradingEngine:
 
         today_str = now_nst().strftime("%Y-%m-%d")
         for sym, reason in exits:
+            if sym not in fresh_quotes:
+                self._log(f"SKIP EXIT {sym}: fresh quote is unavailable")
+                continue
             pos = self.positions.get(sym)
             if not pos:
                 continue

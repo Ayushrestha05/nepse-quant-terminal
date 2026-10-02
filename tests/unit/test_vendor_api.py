@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pandas as pd
+import pytest
 
 from backend.quant_pro import vendor_api
 
@@ -58,3 +61,21 @@ def test_fetch_ohlcv_chunk_treats_html_error_page_as_empty(monkeypatch):
 
     assert isinstance(df, pd.DataFrame)
     assert df.empty
+
+
+def test_fetch_ohlcv_chunk_does_not_retry_http_429(monkeypatch):
+    calls = 0
+
+    def rate_limited(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        error = vendor_api.requests.HTTPError("429 Too Many Requests")
+        error.response = SimpleNamespace(status_code=429, headers={"Retry-After": "60"})
+        raise error
+
+    monkeypatch.setattr(vendor_api._rate_limiter, "wait", lambda: None)
+    monkeypatch.setattr(vendor_api.requests, "get", rate_limited)
+
+    with pytest.raises(vendor_api.requests.HTTPError, match="429"):
+        vendor_api.fetch_ohlcv_chunk("AAA", 1704067200, 1775097600)
+    assert calls == 1

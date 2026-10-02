@@ -11,6 +11,7 @@ from tenacity import (
     retry,
     stop_after_attempt,
     wait_exponential,
+    retry_if_exception,
     retry_if_exception_type,
     before_sleep_log,
 )
@@ -106,6 +107,13 @@ def _report_error(message: str):
     else:
         logger.error(message)
 
+
+def _retry_provider_error(exc: BaseException) -> bool:
+    return (
+        getattr(getattr(exc, "response", None), "status_code", None) != 429
+        and isinstance(exc, (RequestException, Timeout, HTTPError, ValueError))
+    )
+
 # --- OLD CSV LOGIC (Preserved) ---
 def load_csv(file) -> Optional[pd.DataFrame]:
     try:
@@ -162,7 +170,7 @@ def load_macro_series(file) -> Optional[pd.Series]:
 @retry(
     stop=stop_after_attempt(5),
     wait=wait_exponential(multiplier=1, min=2, max=60),
-    retry=retry_if_exception_type((RequestException, Timeout, HTTPError, ValueError)),
+    retry=retry_if_exception(_retry_provider_error),
     before_sleep=before_sleep_log(logger, logging.WARNING),
     reraise=True,
 )
@@ -207,6 +215,8 @@ def fetch_chunk(symbol: str, start_ts, end_ts) -> pd.DataFrame:
     try:
         return _fetch_chunk_with_retry(symbol, start_ts, end_ts)
     except RequestException as e:
+        if getattr(getattr(e, "response", None), "status_code", None) == 429:
+            raise
         logger.error(f"{symbol}: Network error after retries: {e}")
         return pd.DataFrame()
     except ValueError as e:

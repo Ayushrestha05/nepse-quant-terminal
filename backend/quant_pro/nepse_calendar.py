@@ -269,6 +269,17 @@ def market_session_phase(dt: Optional[datetime] = None) -> str:
     return "POSTCLOSE"
 
 
+def latest_completed_session(dt: Optional[datetime] = None) -> date:
+    """Latest session whose daily bar should be finalized by this Nepal time."""
+    current = dt or current_nepal_datetime()
+    session = current.date()
+    if not (is_trading_day(session) and current.hour >= 16):
+        session -= timedelta(days=1)
+    while not is_trading_day(session):
+        session -= timedelta(days=1)
+    return session
+
+
 def derive_holidays_from_db(db_path: Path) -> Set[date]:
     """
     Derive historical NEPSE holidays from the database.

@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import tkinter as tk
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -33,6 +34,7 @@ PAGES = (
     "Account",
     "Strategies",
     "Model Research",
+    "Issues",
 )
 
 
@@ -95,6 +97,8 @@ class DesktopDashboard(tk.Tk):
         self.history_cancel_file: Path | None = None
         self.history_update_running = False
         self.history_errors: list[str] = []
+        self._last_live_quote_refresh = 0.0
+        self._scheduled_history_started = False
         self.strategy_payloads: dict[str, dict[str, Any]] = {}
         self.account_var = tk.StringVar(value="Loading accounts…")
         self.app_status = tk.StringVar(value="Ready")
@@ -104,6 +108,7 @@ class DesktopDashboard(tk.Tk):
             self.after(50, self._poll_ui_events)
             self.after(50, self._load_current_page)
             self.after(60_000, self._auto_refresh)
+            self.after(500, self._schedule_market_data)
         else:
             for name in PAGES:
                 self.pages[name] = self._build_page(name)
@@ -536,6 +541,28 @@ class DesktopDashboard(tk.Tk):
         self._table(periods, "Research periods", (("test_start", "Start", 95), ("test_end", "End", 95), ("train_candidates", "Train N", 70), ("test_candidates", "Test N", 70), ("matured_test_outcomes", "Matured N", 80), ("candidate_hit_rate_pct", "Score hit %", 90), ("brier_score", "Brier", 75), ("baseline_return_pct", "Baseline %", 95), ("model_return_pct", "Model %", 95), ("baseline_trades", "Base trades", 80), ("model_trades", "Model trades", 80), ("baseline_win_rate_pct", "Base win %", 90), ("model_win_rate_pct", "Model win %", 90), ("baseline_profit_factor", "Base PF", 80), ("model_profit_factor", "Model PF", 85)), height=8)
         self._table(trades, "Research trades", (("portfolio", "Portfolio", 90), ("symbol", "Symbol", 80), ("signal_date", "Signal", 90), ("entry_date", "Entry", 90), ("entry_price", "Entry Price", 95), ("exit_date", "Exit", 90), ("exit_price", "Exit Price", 95), ("shares", "Shares", 70), ("net_pnl", "Net P/L", 100), ("net_return_pct", "Net %", 80), ("exit_reason", "Exit reason", 125)), height=8)
 
+    def _build_issues(self, frame):
+        toolbar = ttk.Frame(frame)
+        toolbar.pack(fill="x", pady=(0, 8))
+        ttk.Button(toolbar, text="Retry selected", command=self._retry_selected_issues).pack(side="left")
+        ttk.Button(toolbar, text="Retry eligible", command=self._retry_eligible_issues).pack(side="left", padx=6)
+        self.show_resolved_issues = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            toolbar, text="Show resolved", variable=self.show_resolved_issues,
+            command=lambda: self._load_page("Issues", force=True),
+        ).pack(side="left", padx=8)
+        self.issues_progress = ttk.Progressbar(toolbar, mode="indeterminate", length=170)
+        self.issues_progress.pack(side="right")
+        self.issues_cancel_button = ttk.Button(toolbar, text="Cancel retry", command=self._cancel_history_update, state="disabled")
+        self.issues_cancel_button.pack(side="right", padx=6)
+        self._table(frame, "Issues", (
+            ("issue_id", "ID", 48), ("source", "Source", 95), ("operation", "Operation", 95),
+            ("symbol", "Symbol", 75), ("category", "Category", 115), ("status", "Status", 80),
+            ("attempts", "Attempts", 70), ("last_attempt_utc", "Last attempt (UTC)", 150),
+            ("retry_after_utc", "Retry after (UTC)", 150), ("detail", "Detail", 390),
+        ), height=18)
+        self.tables["Issues"].configure(selectmode="extended")
+
     def _build_page(self, name: str) -> tk.Frame:
         frame = ttk.Frame(self.content, padding=(14, 10, 12, 8))
         self.status_vars[name] = tk.StringVar(value="Select Refresh to load")
@@ -563,6 +590,7 @@ class DesktopDashboard(tk.Tk):
             "Account": self._load_accounts,
             "Strategies": self._load_strategies,
             "Model Research": None,
+            "Issues": self._load_issues,
         }
         if name in {"Lookup", "Agents"} and not force:
             if name not in self.loaded:
@@ -613,6 +641,8 @@ class DesktopDashboard(tk.Tk):
             self._populate(name, payload["rows"], status=payload["status"], detail=payload["detail"])
         elif name == "Rates & Commodities":
             self._populate(name, payload["rows"], status=payload["status"], detail=payload.get("detail", ""))
+        elif name == "Issues":
+            self._populate(name, payload["rows"], status=payload["status"])
         else:
             self._populate(name, payload["rows"], status=payload.get("status", ""))
         self.app_status.set(f"{name} updated")
@@ -650,6 +680,11 @@ class DesktopDashboard(tk.Tk):
             if key == "history_update":
                 self._history_update_failed(error)
                 return
+            if key == "issue_quote_retry":
+                if hasattr(self, "issues_progress"):
+                    self.issues_progress.stop()
+                if "Issues" in self.status_vars:
+                    self.status_vars["Issues"].set(f"Quote retry failed: {error}")
             if key == "research_restore":
                 self._set_research_status(f"Could not load saved results: {error}")
                 return
@@ -665,6 +700,125 @@ class DesktopDashboard(tk.Tk):
             self.loaded.discard(self.current_page)
             self._load_page(self.current_page, force=True)
         self.after(60_000, self._auto_refresh)
+
+    def _schedule_market_data(self):
+        if self.smoke:
+            return
+        try:
+            from backend.quant_pro.nepse_calendar import current_nepal_datetime, latest_completed_session, market_session_phase
+
+            now = current_nepal_datetime()
+            if (market_session_phase(now) == "OPEN" and not self.history_update_running
+                    and time.monotonic() - self._last_live_quote_refresh >= 120):
+                self._last_live_quote_refresh = time.monotonic()
+                self._background("market_quotes", self._fetch_market_snapshot, self._market_quotes_finished, heavy=True)
+
+            expected = latest_completed_session(now).isoformat()
+            if not self.history_update_running and not self._scheduled_history_started:
+                due, old = self._daily_history_symbols(expected)
+                if old:
+                    from backend.quant_pro.data_fetch_issues import record_issue
+
+                    for symbol, last_date in old:
+                        record_issue(
+                            "merolagani", "history", "HISTORY_GAP",
+                            f"Latest stored bar {last_date or 'missing'} is more than 14 days behind completed session {expected}; use Update history.",
+                            symbol=symbol, attempts=0, db_path=self._db_path(),
+                        )
+                if due:
+                    self._scheduled_history_started = True
+                    self._start_history_update(due, scheduled=True, expected_session=expected)
+        except Exception as exc:
+            logging.getLogger(__name__).warning("Market-data scheduler check failed: %s", exc)
+        self.after(15_000, self._schedule_market_data)
+
+    @staticmethod
+    def _fetch_market_snapshot():
+        from backend.quant_pro.realtime_market import get_market_data_provider
+
+        return get_market_data_provider().fetch_snapshot(force=True)
+
+    @staticmethod
+    def _retry_quote_issues(rows: list[dict[str, Any]]) -> str:
+        from backend.quant_pro.realtime_market import get_market_data_provider
+
+        provider = get_market_data_provider()
+        summary = []
+        for source in sorted({str(row.get("source") or "") for row in rows}):
+            selected = [row for row in rows if row.get("source") == source]
+            symbols = sorted({str(row.get("symbol") or "").strip().upper() for row in selected if row.get("symbol")})
+            if source == "nepalstock":
+                snapshot = provider.fetch_snapshot(force=True)
+                summary.append(f"Nepalstock {len(snapshot.quotes):,} quotes")
+            elif source == "merolagani" and symbols:
+                prices = provider._fetch_merolagani_ltps(symbols)
+                summary.append(f"MeroLagani {sum(price is not None for price in prices.values()):,}/{len(symbols):,} symbols")
+        return ", ".join(summary) or "No supported quote issues selected"
+
+    def _daily_history_symbols(self, expected_session: str) -> tuple[list[str], list[tuple[str, str | None]]]:
+        from backend.quant_pro.data_fetch_issues import open_issue_symbols
+
+        conn = sqlite3.connect(str(self._db_path()))
+        try:
+            latest_quote_ts = conn.execute("SELECT MAX(fetched_at_utc) FROM market_quotes").fetchone()[0]
+            symbols = {str(row[0]).upper() for row in conn.execute(
+                "SELECT DISTINCT symbol FROM market_quotes WHERE fetched_at_utc=?", (latest_quote_ts,)
+            ) if row[0]} if latest_quote_ts else set()
+            if not symbols:
+                symbols = {str(row[0]).upper() for row in conn.execute(
+                    "SELECT DISTINCT symbol FROM stock_prices WHERE symbol!='NEPSE' AND symbol NOT LIKE 'SECTOR::%'"
+                ) if row[0]}
+            symbols.add("NEPSE")
+            last_dates = dict(conn.execute(
+                "SELECT symbol,MAX(date) FROM stock_prices WHERE symbol IN (" + ",".join("?" for _ in symbols) + ") GROUP BY symbol",
+                sorted(symbols),
+            )) if symbols else {}
+        finally:
+            conn.close()
+        unresolved = open_issue_symbols("history", db_path=self._db_path())
+        expected = date.fromisoformat(expected_session)
+        due, old = [], []
+        for symbol in sorted(symbols):
+            latest = last_dates.get(symbol)
+            if symbol in unresolved or (latest and str(latest) >= expected_session):
+                continue
+            gap_days = (expected - date.fromisoformat(str(latest))).days if latest else 10_000
+            if gap_days > 14:
+                old.append((symbol, str(latest) if latest else None))
+            else:
+                due.append(symbol)
+        return due, old
+
+    def _market_quotes_finished(self, _snapshot=None):
+        self.loaded.discard("Market")
+        self.loaded.discard("Issues")
+        if self.current_page == "Market":
+            self._load_page("Market", force=True)
+        if self.current_page == "Issues":
+            self._load_page("Issues", force=True)
+
+    @staticmethod
+    def _record_scheduled_history_gaps(db_path: Path, symbols: list[str], expected_session: str) -> list[str]:
+        from backend.quant_pro.data_fetch_issues import record_issue
+
+        if not symbols:
+            return []
+        conn = sqlite3.connect(str(db_path))
+        try:
+            latest = dict(conn.execute(
+                "SELECT symbol,MAX(date) FROM stock_prices WHERE symbol IN (" + ",".join("?" for _ in symbols) + ") GROUP BY symbol",
+                sorted(set(symbols)),
+            ))
+        finally:
+            conn.close()
+        missing = [symbol for symbol in symbols if str(latest.get(symbol) or "") < expected_session]
+        for symbol in missing:
+            record_issue(
+                "merolagani", "history", "HISTORY_GAP",
+                f"No completed bar was stored for {expected_session}; use Retry selected or Update history.",
+                symbol=symbol, db_path=db_path,
+            )
+        return missing
 
     @staticmethod
     def _market_coverage(db_path: Path) -> str:
@@ -778,7 +932,22 @@ class DesktopDashboard(tk.Tk):
                 )
         return {"rows": rows, "summary": summary, "health": self._market_coverage(self._db_path())}
 
-    def _start_history_update(self) -> None:
+    def _load_issues(self):
+        from backend.quant_pro.data_fetch_issues import list_issues
+
+        rows = list_issues(include_resolved=self.show_resolved_issues.get(), db_path=self._db_path())
+        eligible = sum(
+            not row.get("retry_after_utc")
+            or row["retry_after_utc"] <= datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+            for row in rows
+        )
+        return {"rows": rows, "status": f"{len(rows):,} open or degraded · {eligible:,} currently eligible for retry"}
+
+    def _start_history_update(
+        self, symbols: list[str] | None = None, *, scheduled: bool = False, retry_quotes: bool = False,
+        deep_backfill: bool = False, quote_rows: list[dict[str, Any]] | None = None,
+        expected_session: str | None = None,
+    ) -> None:
         if self.history_update_running:
             return
         cancel_file = Path(tempfile.gettempdir()) / f"nepse-ingestion-{os.getpid()}-{uuid.uuid4().hex}.cancel"
@@ -787,15 +956,42 @@ class DesktopDashboard(tk.Tk):
         self.history_errors = []
         self.history_update_button.configure(state="disabled")
         self.history_cancel_button.configure(state="normal")
+        if hasattr(self, "issues_cancel_button"):
+            self.issues_cancel_button.configure(state="normal")
         self.history_error_button.configure(state="disabled")
         self.history_progress.configure(mode="indeterminate")
         self.history_progress.start(12)
-        self.history_status.set("Starting the historical price update…")
-        self._background("history_update", lambda: self._run_history_update(cancel_file), self._history_update_finished, heavy=True)
+        self.history_status.set(
+            f"Updating {len(symbols):,} selected symbols…" if symbols is not None
+            else "Starting the historical price update…"
+        )
+        if hasattr(self, "issues_progress"):
+            self.issues_progress.start(12)
+        self._background(
+            "history_update",
+            lambda: self._run_history_update(
+                cancel_file, symbols=symbols, retry_quotes=retry_quotes,
+                deep_backfill=(deep_backfill or (not scheduled and symbols is None)),
+                quote_rows=quote_rows,
+                expected_session=expected_session,
+            ),
+            self._history_update_finished,
+            heavy=True,
+        )
 
-    def _run_history_update(self, cancel_file: Path) -> dict[str, Any]:
+    def _run_history_update(
+        self, cancel_file: Path, *, symbols: list[str] | None = None, retry_quotes: bool = False,
+        deep_backfill: bool = False, quote_rows: list[dict[str, Any]] | None = None,
+        expected_session: str | None = None,
+    ) -> dict[str, Any]:
         script = Path(__file__).resolve().parents[2] / "scripts" / "ingestion" / "deterministic_daily_ingestion.py"
+        symbols_file = cancel_file.with_suffix(".symbols")
         command = [sys.executable, "-u", str(script), "--source", "both", "--cancel-file", str(cancel_file)]
+        if symbols is not None:
+            symbols_file.write_text("\n".join(sorted(set(symbols))) + "\n", encoding="utf-8")
+            command = [sys.executable, "-u", str(script), "--source", "file", "--symbols-file", str(symbols_file), "--cancel-file", str(cancel_file)]
+        if deep_backfill:
+            command.extend(("--backfill-days", "3650"))
         lines: list[str] = []
         run_id = None
         progress = re.compile(r"\[(\d+)/(\d+)\]")
@@ -839,16 +1035,37 @@ class DesktopDashboard(tk.Tk):
                     "SELECT symbol,error FROM ingestion_run_symbols WHERE run_id=? AND status='FAILED' ORDER BY symbol",
                     (run_id,),
                 )]
+                successful_symbols = [str(row[0]) for row in conn.execute(
+                    "SELECT symbol FROM ingestion_run_symbols WHERE run_id=? AND status='SUCCESS'", (run_id,)
+                )]
             finally:
                 conn.close()
+            if successful_symbols:
+                from backend.backtesting.simple_backtest import refresh_shared_price_history
+
+                refresh_shared_price_history(successful_symbols, self._db_path())
+            if expected_session:
+                self._record_scheduled_history_gaps(self._db_path(), symbols or [], expected_session)
+        else:
+            successful_symbols = []
+        quote_error = None
+        quote_summary = ""
+        cancelled = cancel_file.exists()
+        if retry_quotes and not cancelled:
+            try:
+                quote_summary = self._retry_quote_issues(quote_rows or [])
+            except Exception as exc:
+                quote_error = str(exc)
         try:
             cancel_file.unlink(missing_ok=True)
+            symbols_file.unlink(missing_ok=True)
         except OSError:
             pass
         return {
             "return_code": return_code, "status": status, "succeeded": succeeded,
             "failed": failed, "rows_fetched": fetched, "latest": latest,
-            "errors": errors, "output": lines,
+            "errors": errors, "output": lines, "successful_symbols": successful_symbols,
+            "quote_error": quote_error, "quote_summary": quote_summary,
         }
 
     def _history_progress(self, completed: int, total: int, line: str) -> None:
@@ -863,6 +1080,11 @@ class DesktopDashboard(tk.Tk):
         self.history_progress.configure(mode="determinate", value=0)
         self.history_update_button.configure(state="normal")
         self.history_cancel_button.configure(state="disabled")
+        if hasattr(self, "issues_cancel_button"):
+            self.issues_cancel_button.configure(state="disabled")
+        self._scheduled_history_started = False
+        if hasattr(self, "issues_progress"):
+            self.issues_progress.stop()
 
     def _history_update_finished(self, result: dict[str, Any]) -> None:
         self._finish_history_update_controls()
@@ -877,6 +1099,13 @@ class DesktopDashboard(tk.Tk):
             self.history_errors = result["output"]
             self.history_error_button.configure(state="normal")
         self.app_status.set(f"Price history update {status.lower()}")
+        if result.get("quote_error"):
+            self.app_status.set(f"Quote retry failed: {result['quote_error']}")
+        elif result.get("quote_summary"):
+            self.app_status.set(f"Quote retry completed · {result['quote_summary']}")
+        self.loaded.discard("Issues")
+        if self.current_page == "Issues":
+            self._load_page("Issues", force=True)
         for page in ("Market", "Signals", "Portfolio", "Watchlist", "Account", "Lookup"):
             self.loaded.discard(page)
         if "Market" in self.pages:
@@ -886,6 +1115,12 @@ class DesktopDashboard(tk.Tk):
 
     def _history_update_failed(self, error: Exception) -> None:
         self._finish_history_update_controls()
+        from backend.quant_pro.data_fetch_issues import classify_fetch_error, record_issue, retry_after_from_error
+
+        record_issue(
+            "merolagani", "history", classify_fetch_error(error), str(error),
+            retry_after_utc=retry_after_from_error(error),
+        )
         self.history_status.set(f"History update failed: {error}")
         self.app_status.set(f"History update failed: {error}")
 
@@ -896,24 +1131,72 @@ class DesktopDashboard(tk.Tk):
             self.history_status.set("Cancellation requested · the current symbol will finish first.")
 
     def _show_history_errors(self) -> None:
-        if not self.history_errors:
+        if "Issues" in self.page_list.get_children(""):
+            self.page_list.selection_set("Issues")
+            self.page_list.see("Issues")
+
+    def _selected_issue_rows(self) -> list[dict[str, Any]]:
+        table = self.tables.get("Issues")
+        if table is None:
+            return []
+        by_id = {int(row["issue_id"]): row for row in self.table_rows.get("Issues", [])}
+        selected = []
+        for item in table.selection():
+            values = table.item(item, "values")
+            if values:
+                try:
+                    row = by_id.get(int(values[0]))
+                except (ValueError, TypeError):
+                    row = None
+                if row:
+                    selected.append(row)
+        return selected
+
+    def _retry_selected_issues(self) -> None:
+        self._retry_issues(self._selected_issue_rows())
+
+    def _retry_eligible_issues(self) -> None:
+        from backend.quant_pro.data_fetch_issues import list_issues
+
+        self._retry_issues(list_issues(eligible_only=True))
+
+    def _retry_issues(self, rows: list[dict[str, Any]]) -> None:
+        now = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+        rows = [row for row in rows if row.get("status") != "RESOLVED"]
+        blocked = [row for row in rows if row.get("retry_after_utc") and row["retry_after_utc"] > now]
+        if blocked:
+            soonest = min(row["retry_after_utc"] for row in blocked)
+            self.app_status.set(f"Retry paused by provider cooldown until {soonest}")
             return
-        window = tk.Toplevel(self)
-        window.title("History update details")
-        window.geometry("760x440")
-        body = ttk.Frame(window, padding=8)
-        body.pack(fill="both", expand=True)
-        text = tk.Text(body, wrap="none", undo=False, background=self.theme_bg, foreground=self.theme_fg, insertbackground=self.theme_fg, borderwidth=0, relief="flat")
-        ybar = ttk.Scrollbar(body, orient="vertical", command=text.yview)
-        xbar = ttk.Scrollbar(body, orient="horizontal", command=text.xview)
-        text.configure(yscrollcommand=ybar.set, xscrollcommand=xbar.set)
-        text.insert("1.0", "\n".join(self.history_errors))
-        text.configure(state="disabled")
-        text.grid(row=0, column=0, sticky="nsew")
-        ybar.grid(row=0, column=1, sticky="ns")
-        xbar.grid(row=1, column=0, sticky="ew")
-        body.rowconfigure(0, weight=1)
-        body.columnconfigure(0, weight=1)
+        history = [row for row in rows if row.get("operation") == "history"]
+        quotes = [row for row in rows if row.get("source") in {"nepalstock", "merolagani"} and row.get("operation") in {"quotes", "market_status"}]
+        if history:
+            symbols = sorted({str(row.get("symbol") or "").strip().upper() for row in history if row.get("symbol")})
+            if not symbols:
+                symbols = None
+            self._start_history_update(
+                symbols, retry_quotes=bool(quotes),
+                deep_backfill=any(row.get("category") == "HISTORY_GAP" for row in history),
+                quote_rows=quotes,
+            )
+        elif quotes:
+            if hasattr(self, "issues_progress"):
+                self.issues_progress.start(12)
+            self.app_status.set("Retrying the latest market-wide quote snapshot…")
+            self._background(
+                "issue_quote_retry", lambda: self._retry_quote_issues(quotes),
+                self._issue_quote_retry_finished, heavy=True,
+            )
+        elif rows:
+            self.app_status.set("These issues need the source-specific update action on the Market page.")
+        else:
+            self.app_status.set("Select one or more eligible issues to retry.")
+
+    def _issue_quote_retry_finished(self, summary="") -> None:
+        if hasattr(self, "issues_progress"):
+            self.issues_progress.stop()
+        self.app_status.set(f"Quote retry completed · {summary}" if summary else "Quote retry completed")
+        self._market_quotes_finished()
 
     def _load_portfolio(self, account_id: str):
         import pandas as pd
@@ -942,18 +1225,14 @@ class DesktopDashboard(tk.Tk):
         return {"rows": rows, "trades": trade_rows, "summary": summary, "account_id": account_id}
 
     def _load_signals(self, account_id: str):
-        from backend.backtesting.simple_backtest import load_all_prices
+        from backend.backtesting.simple_backtest import load_shared_price_history
         from backend.trading import strategy_registry
         from backend.trading.live_trader import generate_signals
         from configs.long_term import LONG_TERM_CONFIG
 
         strategy = strategy_registry.load_strategy(str(self._account(account_id).get("strategy_id") or ""))
         config = dict((strategy or {}).get("config") or LONG_TERM_CONFIG)
-        conn = sqlite3.connect(str(self._db_path()))
-        try:
-            prices = load_all_prices(conn)
-        finally:
-            conn.close()
+        prices = load_shared_price_history(self._db_path())
         signals, regime = generate_signals(prices, list(config.get("signal_types") or LONG_TERM_CONFIG["signal_types"]))
         rows = [{
             "symbol": row.get("symbol"),
@@ -1501,7 +1780,7 @@ def main() -> int:
     args = parser.parse_args()
     app = DesktopDashboard(smoke=args.smoke)
     if args.smoke:
-        valid = len(app.page_list.get_children("")) == len(PAGES) and len(app.pages) == len(PAGES) and len(app.tables) == 13
+        valid = len(app.page_list.get_children("")) == len(PAGES) and len(app.pages) == len(PAGES) and len(app.tables) == 14
         app._populate("Signals", [{"symbol": f"SYM{i:03d}"} for i in range(205)])
         valid = valid and len(app.tables["Signals"].get_children()) == 100
         valid = valid and app.table_pagers["Signals"][0].cget("text") == "1–100 of 205"

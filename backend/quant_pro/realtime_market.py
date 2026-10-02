@@ -11,6 +11,7 @@ import os
 import threading
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional
 
 import requests
@@ -32,11 +33,31 @@ def _env_bool(name: str, default: bool) -> bool:
     return value.strip().lower() in _TRUTHY
 
 
-INTRADAY_CACHE_SECS = int(os.environ.get("NEPSE_INTRADAY_CACHE_SECS", "15"))
+INTRADAY_CACHE_SECS = max(120, int(os.environ.get("NEPSE_INTRADAY_CACHE_SECS", "120")))
 INTRADAY_DB_FALLBACK_MAX_AGE_SECS = int(
     os.environ.get("NEPSE_INTRADAY_DB_FALLBACK_MAX_AGE_SECS", "900")
 )
 NEPALSTOCK_TLS_VERIFY = _env_bool("NEPALSTOCK_TLS_VERIFY", False)
+
+
+def quote_is_fresh(
+    symbol: str,
+    batch_info: Dict[str, Any],
+    *,
+    max_age_seconds: int = 120,
+    now: datetime | None = None,
+) -> bool:
+    timestamp = (batch_info.get("timestamp_map") or {}).get(str(symbol).strip().upper())
+    if not timestamp:
+        return False
+    try:
+        fetched = datetime.fromisoformat(str(timestamp).replace("Z", "+00:00"))
+        if fetched.tzinfo is None:
+            fetched = fetched.replace(tzinfo=timezone.utc)
+        age = ((now or datetime.now(timezone.utc)) - fetched.astimezone(timezone.utc)).total_seconds()
+        return -5 <= age <= max_age_seconds
+    except (TypeError, ValueError):
+        return False
 
 
 def _as_float(value: Any) -> Optional[float]:
@@ -75,11 +96,20 @@ class RealtimeMarketDataProvider:
 
     def _get_client(self):
         if self._client is None:
-            from nepse import Nepse
+            try:
+                from nepse import Nepse
 
-            client = Nepse()
-            client.setTLSVerification(NEPALSTOCK_TLS_VERIFY)
-            self._client = client
+                client = Nepse()
+                client.setTLSVerification(NEPALSTOCK_TLS_VERIFY)
+                self._client = client
+            except Exception as exc:
+                from .data_fetch_issues import classify_fetch_error, record_issue, retry_after_from_error
+
+                record_issue(
+                    "nepalstock", "quotes", classify_fetch_error(exc), str(exc),
+                    retry_after_utc=retry_after_from_error(exc),
+                )
+                raise
         return self._client
 
     def _normalize_quote(
@@ -164,23 +194,57 @@ class RealtimeMarketDataProvider:
         market_status = None
         try:
             market_status = client.getMarketStatus()
+            from .data_fetch_issues import resolve_issues
+
+            resolve_issues("nepalstock", "market_status")
         except Exception as exc:
             logger.warning("Failed to fetch Nepalstock market status: %s", exc)
+            from .data_fetch_issues import classify_fetch_error, record_issue, retry_after_from_error
+
+            record_issue(
+                "nepalstock", "market_status", classify_fetch_error(exc), str(exc),
+                retry_after_utc=retry_after_from_error(exc), status="OPEN",
+            )
+            if getattr(getattr(exc, "response", None), "status_code", None) == 429:
+                raise
 
         endpoint = "live_market"
         rows: List[Dict[str, Any]] = []
+        live_market_error: Exception | None = None
         try:
             live_rows = client.getLiveMarket()
             if isinstance(live_rows, list):
                 rows = live_rows
         except Exception as exc:
+            live_market_error = exc
             logger.warning("Nepalstock live market fetch failed: %s", exc)
+            from .data_fetch_issues import classify_fetch_error, record_issue, retry_after_from_error
+
+            record_issue(
+                "nepalstock", "quotes", classify_fetch_error(exc), str(exc),
+                retry_after_utc=retry_after_from_error(exc), status="OPEN",
+            )
+            if getattr(getattr(exc, "response", None), "status_code", None) == 429:
+                raise
 
         if not rows:
             endpoint = "price_volume"
-            rows = client.getPriceVolume()
+            try:
+                rows = client.getPriceVolume()
+            except Exception as exc:
+                from .data_fetch_issues import classify_fetch_error, record_issue, retry_after_from_error
+
+                record_issue(
+                    "nepalstock", "quotes", classify_fetch_error(exc), str(exc),
+                    retry_after_utc=retry_after_from_error(exc),
+                )
+                raise
             if not isinstance(rows, list):
-                raise ValueError("Nepalstock price volume response was not a list")
+                error = ValueError("Nepalstock price volume response was not a list")
+                from .data_fetch_issues import record_issue
+
+                record_issue("nepalstock", "quotes", "INVALID_RESPONSE", str(error))
+                raise error
 
         quotes = []
         quotes_by_symbol: Dict[str, Dict[str, Any]] = {}
@@ -203,6 +267,16 @@ class RealtimeMarketDataProvider:
             market_status=market_status if isinstance(market_status, dict) else None,
         )
 
+        from .data_fetch_issues import classify_fetch_error, record_issue, resolve_issues
+
+        resolve_issues("nepalstock", "quotes")
+        if live_market_error is not None:
+            record_issue(
+                "nepalstock", "quotes", classify_fetch_error(live_market_error),
+                f"Live-market endpoint failed; {endpoint} fallback supplied the snapshot: {live_market_error}",
+                status="DEGRADED",
+            )
+
         return MarketSnapshot(
             quotes=quotes_by_symbol,
             source="nepalstock",
@@ -213,6 +287,15 @@ class RealtimeMarketDataProvider:
         )
 
     def fetch_snapshot(self, *, force: bool = False) -> MarketSnapshot:
+        from .data_fetch_issues import list_issues
+
+        quote_issues = [
+            row for row in list_issues()
+            if row["source"] == "nepalstock" and row["operation"] in {"quotes", "market_status"}
+        ]
+        deadlines = [str(row["retry_after_utc"]) for row in quote_issues if row.get("retry_after_utc")]
+        if deadlines and max(deadlines) > datetime.now(timezone.utc).replace(microsecond=0).isoformat():
+            raise RuntimeError(f"Nepalstock quote fetch is cooling down until {max(deadlines)}")
         if not force and self._snapshot is not None and time.monotonic() < self._cache_deadline:
             return self._snapshot
 
@@ -222,7 +305,7 @@ class RealtimeMarketDataProvider:
             snapshot = self._fetch_primary_snapshot()
             self._snapshot = snapshot
             self._cache_deadline = time.monotonic() + max(1, INTRADAY_CACHE_SECS)
-            return snapshot
+        return snapshot
 
     def get_latest_ltps(
         self,
@@ -355,13 +438,20 @@ class RealtimeMarketDataProvider:
 
     def _fetch_merolagani_ltps(self, symbols: Iterable[str]) -> Dict[str, Optional[float]]:
         prices: Dict[str, Optional[float]] = {}
+        symbols = [str(symbol).strip().upper() for symbol in symbols if str(symbol).strip()]
+        from .data_fetch_issues import list_issues, record_issue, resolve_issues, classify_fetch_error, retry_after_from_error
+
+        now = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+        deadlines = [
+            str(row["retry_after_utc"]) for row in list_issues()
+            if row["source"] == "merolagani" and row["operation"] == "quotes" and row.get("retry_after_utc")
+        ]
+        if deadlines and max(deadlines) > now:
+            return {symbol: None for symbol in symbols}
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
         }
-        for symbol in symbols:
-            symbol = str(symbol).strip().upper()
-            if not symbol:
-                continue
+        for index, symbol in enumerate(symbols):
             try:
                 url = f"https://merolagani.com/CompanyDetail.aspx?symbol={symbol}"
                 response = requests.get(url, headers=headers, timeout=10)
@@ -370,9 +460,28 @@ class RealtimeMarketDataProvider:
                 ltp = soup.select_one("#ctl00_ContentPlaceHolder1_CompanyDetail1_lblMarketPrice")
                 price = _as_float(ltp.text if ltp is not None else None)
                 prices[symbol] = price
+                if price is None or price <= 0:
+                    record_issue("merolagani", "quotes", "INVALID_RESPONSE", "Company page did not contain a valid last-traded price.", symbol=symbol)
+                else:
+                    resolve_issues("merolagani", "quotes", symbols=[symbol])
             except Exception as exc:
                 logger.warning("Fallback MeroLagani fetch failed for %s: %s", symbol, exc)
                 prices[symbol] = None
+                category = classify_fetch_error(exc)
+                retry_after = retry_after_from_error(exc)
+                record_issue(
+                    "merolagani", "quotes", category, str(exc), symbol=symbol,
+                    retry_after_utc=retry_after,
+                )
+                if category == "RATE_LIMITED":
+                    for deferred in symbols[index + 1:]:
+                        prices[deferred] = None
+                        record_issue(
+                            "merolagani", "quotes", "RATE_LIMITED",
+                            f"Deferred after provider rate limit; retry after {retry_after or 'cooldown'}.",
+                            symbol=deferred, retry_after_utc=retry_after, attempts=0,
+                        )
+                    break
         return prices
 
 
