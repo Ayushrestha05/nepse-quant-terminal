@@ -149,11 +149,13 @@ def rank_signal_candidates(
     sector_exposure: Optional[Dict[str, float]] = None,
     sector_lookup: Optional[Callable[[str], Optional[str]]] = None,
     event_context: Optional[EventAdjustmentContext] = None,
+    score_overrides: Optional[Dict[str, float]] = None,
 ) -> List[Dict[str, Any]]:
     held = {canonicalize_signal_symbol(symbol) for symbol in (held_symbols or []) if str(symbol).strip()}
     exposure = {str(k).strip().upper(): float(v) for k, v in (sector_exposure or {}).items()}
     lookup = sector_lookup or (lambda _symbol: None)
     context = event_context or EventAdjustmentContext()
+    overrides = {canonicalize_signal_symbol(k): float(v) for k, v in (score_overrides or {}).items()}
 
     remaining = [item for item in merge_signal_candidates(signals) if item["symbol"] not in held]
     ordered: List[Dict[str, Any]] = []
@@ -168,7 +170,8 @@ def rank_signal_candidates(
             base_penalty = _sector_weight_penalty(exposure.get(sector_key, 0.0))
             cycle_sector_penalty = 0.90 if sector_key and selected_sectors.get(sector_key, 0) > 0 else 1.0
             signal_type_penalty = _signal_type_penalty(selected_signal_types.get(candidate["signal_type"], 0))
-            base_rank_score = float(candidate["raw_score"]) * base_penalty * cycle_sector_penalty * signal_type_penalty
+            score = overrides.get(candidate["symbol"], float(candidate["raw_score"]))
+            base_rank_score = score * base_penalty * cycle_sector_penalty * signal_type_penalty
             event_details = context.details_for(candidate["symbol"], sector)
             final_rank_score = base_rank_score * (1.0 + float(event_details["event_adjustment"]))
             reasoning = str(candidate.get("reasoning") or "").strip()

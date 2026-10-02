@@ -18,6 +18,7 @@ Usage:
 
 import argparse
 import logging
+import math
 import multiprocessing
 import sqlite3
 from collections import defaultdict
@@ -38,7 +39,11 @@ from backend.quant_pro.alpha_practical import (
 from backend.quant_pro.sectors import SECTOR_GROUPS
 from backend.quant_pro.database import get_db_path
 from backend.quant_pro.event_layer import load_event_adjustment_context
-from backend.quant_pro.signal_ranking import is_tradeable_signal_symbol, rank_signal_candidates
+from backend.quant_pro.signal_ranking import (
+    canonicalize_signal_symbol,
+    is_tradeable_signal_symbol,
+    rank_signal_candidates,
+)
 
 # Agent 3 signal imports (Citadel upgrade)
 from backend.quant_pro.disposition import generate_cgo_signals_at_date
@@ -414,6 +419,10 @@ class BacktestResult:
 
         lines.append("=" * 70)
         return "\n".join(lines)
+
+
+class BacktestCancelled(RuntimeError):
+    """Raised when a caller cancels an in-progress backtest."""
 
 
 # =============================================================================
@@ -2029,6 +2038,11 @@ def run_backtest(
     regime_sector_limits: Optional[Dict[str, float]] = None,
     use_broker_exit: bool = False,
     progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    candidate_observer: Optional[Callable[..., None]] = None,
+    candidate_score_overrides: Optional[Dict[Tuple[str, str], float]] = None,
+    require_candidate_score: bool = False,
+    slippage_pct: float = 0.0,
+    cancel_event: Any = None,
 ) -> BacktestResult:
     """
     Run walk-forward portfolio backtest with realistic capital tracking.
@@ -2042,6 +2056,9 @@ def run_backtest(
     """
     start = datetime.strptime(start_date, "%Y-%m-%d")
     end = datetime.strptime(end_date, "%Y-%m-%d")
+    slippage_pct = float(slippage_pct)
+    if not math.isfinite(slippage_pct) or not 0.0 <= slippage_pct <= 0.05:
+        raise ValueError("slippage_pct must be between 0 and 0.05 (5%)")
 
     def _emit_progress(payload: Dict[str, Any]) -> None:
         if progress_callback is None:
@@ -2137,6 +2154,9 @@ def run_backtest(
     # Generate trading dates
     all_dates = sorted(prices_df["date"].unique())
     trading_dates = [d for d in all_dates if start <= d <= end]
+    score_by_date: Dict[str, Dict[str, float]] = defaultdict(dict)
+    for (score_date, symbol), score in (candidate_score_overrides or {}).items():
+        score_by_date[str(score_date)[:10]][str(symbol).strip().upper()] = float(score)
 
     if not trading_dates:
         logger.error("No trading dates in range")
@@ -2171,6 +2191,8 @@ def run_backtest(
 
     progress_step = max(1, len(trading_dates) // 100)
     for i, current_date in enumerate(trading_dates):
+        if cancel_event is not None and cancel_event.is_set():
+            raise BacktestCancelled("Backtest cancelled")
         current_date = pd.Timestamp(current_date)
 
         # ----- STEP 1: Execute pending entries at today's open -----
@@ -2182,14 +2204,15 @@ def run_backtest(
                 break
 
             # Get today's open price for this symbol
-            open_price = open_lookup.get(symbol, {}).get(current_date)
-            if open_price is None or not (open_price > 0):  # catches None, NaN, 0, negative
+            market_open = open_lookup.get(symbol, {}).get(current_date)
+            if market_open is None or not (market_open > 0):  # catches None, NaN, 0, negative
                 continue
 
             # Apply circuit breaker to entry price
             prev_close = prev_close_lookup.get(symbol, {}).get(current_date)
             if prev_close is not None:
-                open_price = apply_circuit_breaker(open_price, prev_close)
+                market_open = apply_circuit_breaker(market_open, prev_close)
+            open_price = market_open * (1.0 + slippage_pct)
 
             # Position sizing: equal-weight
             per_position = initial_capital / max_positions
@@ -2255,7 +2278,7 @@ def run_backtest(
                 buy_fees=buy_fees,
                 signal_type=entry_info.get("signal_type", ""),
                 direction=1,
-                max_price=open_price,
+                max_price=market_open,
                 entry_trading_idx=i,
                 target_exit_date=entry_info.get("target_exit_date"),
                 max_holding_days=trade_max_hold,
@@ -2327,13 +2350,13 @@ def run_backtest(
                     current_price = close_price
 
             if exit_reason:
-                # Calculate sell fees
-                sell_fees = NepseFees.total_fees(trade.shares, current_price, is_sell=True)
-                proceeds = trade.shares * current_price - sell_fees
+                fill_price = current_price * (1.0 - slippage_pct)
+                sell_fees = NepseFees.total_fees(trade.shares, fill_price, is_sell=True)
+                proceeds = trade.shares * fill_price - sell_fees
                 cash += proceeds
 
                 trade.exit_date = current_date
-                trade.exit_price = current_price
+                trade.exit_price = fill_price
                 trade.sell_fees = sell_fees
                 trade.exit_reason = exit_reason
                 completed_trades.append(trade)
@@ -2546,6 +2569,24 @@ def run_backtest(
                 if not is_circuit_breaker_hit(prices_df, sig.symbol, current_date)
             ]
 
+            if candidate_observer is not None:
+                candidate_observer(
+                    current_date,
+                    all_signals,
+                    prices_df=prices_df,
+                    symbol_cache=symbol_cache,
+                    trading_dates=trading_dates,
+                    date_index=i,
+                    regime=regime,
+                )
+
+            current_scores = score_by_date.get(current_date.strftime("%Y-%m-%d"), {})
+            if require_candidate_score:
+                all_signals = [
+                    sig for sig in all_signals
+                    if canonicalize_signal_symbol(sig.symbol) in current_scores
+                ]
+
             # Queue top signals for next-day execution using the shared ranker.
             effective_max = regime_pos_limit if regime_max_positions is not None else max_positions
             slots_available = effective_max - len(current_positions)
@@ -2580,6 +2621,7 @@ def run_backtest(
                 sector_exposure=sector_exposure,
                 sector_lookup=get_symbol_sector,
                 event_context=load_event_adjustment_context(current_date),
+                score_overrides=current_scores,
             )
 
             for signal in ranked_signals:
@@ -2630,6 +2672,7 @@ def run_backtest(
         exit_fill = get_price_on_or_before_date(prices_df, symbol, end)
         if exit_fill:
             exit_date, exit_price = exit_fill
+            exit_price *= 1.0 - slippage_pct
             sell_fees = NepseFees.total_fees(trade.shares, exit_price, is_sell=True)
             trade.exit_date = exit_date
             trade.exit_price = exit_price
@@ -2637,6 +2680,14 @@ def run_backtest(
             trade.exit_reason = "end_of_backtest"
             cash += trade.shares * exit_price - sell_fees
             completed_trades.append(trade)
+
+    if daily_nav:
+        end_nav = cash + sum(
+            trade.shares * close_lookup.get(symbol, {}).get(daily_nav[-1][0], trade.entry_price)
+            for symbol, trade in current_positions.items()
+            if trade.exit_price is None
+        )
+        daily_nav[-1] = (daily_nav[-1][0], end_nav)
 
     return BacktestResult(
         trades=completed_trades,

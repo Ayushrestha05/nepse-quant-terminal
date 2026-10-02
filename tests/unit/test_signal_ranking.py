@@ -122,3 +122,20 @@ def test_missing_event_data_keeps_base_order():
     )
 
     assert [item["symbol"] for item in ranked] == ["AAA", "BBB"]
+
+
+def test_model_score_override_changes_order_without_changing_default():
+    signals = [
+        {"symbol": "AAA", "signal_type": "fundamental", "strength": 0.9, "confidence": 0.9},
+        {"symbol": "BBB", "signal_type": "fundamental", "strength": 0.2, "confidence": 0.2},
+    ]
+
+    baseline = rank_signal_candidates(signals, sector_lookup=lambda _symbol: None)
+    model_ranked = rank_signal_candidates(
+        signals,
+        sector_lookup=lambda _symbol: None,
+        score_overrides={"AAA": 0.1, "BBB": 0.9},
+    )
+
+    assert [item["symbol"] for item in baseline] == ["AAA", "BBB"]
+    assert [item["symbol"] for item in model_ranked] == ["BBB", "AAA"]
