@@ -144,6 +144,49 @@ def test_md_refresh_dedupes_duplicate_symbol_session_rows(tmp_path, monkeypatch)
     assert list(md.vol_top["symbol"]) == ["BBB", "AAA"]
 
 
+def test_md_uses_current_quote_baseline_and_ignores_old_history_across_gap(tmp_path, monkeypatch):
+    db_path = tmp_path / "gap.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        "CREATE TABLE stock_prices (symbol TEXT, date TEXT, open REAL, high REAL, low REAL, close REAL, volume REAL)"
+    )
+    conn.execute(
+        """CREATE TABLE market_quotes (
+            raw_id INTEGER, symbol TEXT, security_id TEXT, security_name TEXT,
+            last_traded_price REAL, close_price REAL, previous_close REAL,
+            percentage_change REAL, total_trade_quantity REAL, source TEXT, fetched_at_utc TEXT
+        )"""
+    )
+    conn.executemany(
+        "INSERT INTO stock_prices (symbol,date,open,high,low,close,volume) VALUES (?,?,?,?,?,?,?)",
+        [
+            ("AAA", "2026-04-15", 100, 100, 100, 100, 1000),
+            ("BBB", "2026-04-15", 50, 50, 50, 50, 1000),
+            ("AAA", "2026-10-02", 109, 111, 108, 110, 1200),
+            ("CCC", "2026-10-02", 20, 20, 20, 20, 200),
+        ],
+    )
+    conn.executemany(
+        """INSERT INTO market_quotes (
+            raw_id,symbol,last_traded_price,previous_close,percentage_change,total_trade_quantity,source,fetched_at_utc
+        ) VALUES (1,?,?,?,?,?,'test','2026-10-02T17:46:27+00:00')""",
+        [("AAA", 110, 100, 10, 1000), ("BBB", 45, 50, -10, 800)],
+    )
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(dashboard_data, "_db", lambda: sqlite3.connect(str(db_path)))
+
+    md = dashboard_data.MD(0)
+    rows = md.df.set_index("symbol")
+
+    assert md.latest == "2026-10-02"
+    assert len(md.df) == 3
+    assert round(rows.loc["AAA", "chg"], 2) == 10.0
+    assert round(rows.loc["BBB", "chg"], 2) == -10.0
+    assert pd.isna(rows.loc["CCC", "chg"])
+    assert (md.adv, md.dec, md.unch) == (1, 1, 0)
+
+
 def test_load_port_returns_empty_frame_when_no_file(tmp_path, monkeypatch):
     monkeypatch.setattr(
         dashboard_data, "PAPER_PORTFOLIO_FILE", tmp_path / "paper_portfolio.csv")

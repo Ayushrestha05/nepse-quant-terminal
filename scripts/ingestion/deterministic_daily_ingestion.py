@@ -315,7 +315,10 @@ def execute_ingestion(
     sleep_ms: int,
     strict: bool,
     max_full_resyncs: int = 25,
+    cancel_file: Optional[Path] = None,
 ) -> int:
+    global _shutdown_requested
+    _shutdown_requested = False
     signal.signal(signal.SIGINT, _handle_shutdown)
     signal.signal(signal.SIGTERM, _handle_shutdown)
 
@@ -355,6 +358,10 @@ def execute_ingestion(
             print(f"[ingestion] pending re-sync failed for {pending}: {exc}")
 
     for idx, symbol in enumerate(symbols, start=1):
+        if cancel_file is not None and cancel_file.exists():
+            _shutdown_requested = True
+            print(f"[ingestion] Graceful shutdown before {idx}/{len(symbols)} symbols")
+            break
         latest_symbol_before = get_symbol_latest_date(conn, symbol)
         rows_before = get_symbol_row_count(conn, symbol)
         try:
@@ -453,6 +460,8 @@ def execute_ingestion(
         if sleep_ms > 0:
             time.sleep(sleep_ms / 1000.0)
 
+        if cancel_file is not None and cancel_file.exists():
+            _shutdown_requested = True
         if _shutdown_requested:
             print(f"[ingestion] Graceful shutdown after {idx}/{len(symbols)} symbols")
             status = "PARTIAL"
@@ -463,7 +472,9 @@ def execute_ingestion(
     if latest_after is not None:
         freshness_days = (datetime.now().date() - pd.Timestamp(latest_after).date()).days
 
-    if failed == 0 and freshness_days is not None and freshness_days <= max_staleness_days:
+    if _shutdown_requested:
+        status = "PARTIAL"
+    elif failed == 0 and freshness_days is not None and freshness_days <= max_staleness_days:
         status = "SUCCESS"
     elif succeeded > 0:
         status = "PARTIAL"
@@ -515,6 +526,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--backfill-days", type=int, default=5, help="Overlap window for existing symbols")
     parser.add_argument("--max-staleness-days", type=int, default=7, help="Freshness SLA")
     parser.add_argument("--sleep-ms", type=int, default=0, help="Optional sleep between symbols")
+    parser.add_argument("--cancel-file", type=Path, default=None, help="Stop after the current symbol when this file exists")
     parser.add_argument(
         "--max-full-resyncs",
         type=int,
@@ -563,6 +575,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             sleep_ms=args.sleep_ms,
             strict=args.strict,
             max_full_resyncs=args.max_full_resyncs,
+            cancel_file=args.cancel_file,
         )
     finally:
         conn.close()

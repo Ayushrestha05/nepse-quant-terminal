@@ -7,11 +7,16 @@ import logging
 import math
 import os
 import queue
+import re
 import sqlite3
+import subprocess
+import sys
+import tempfile
 import threading
 import tkinter as tk
+import uuid
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 from typing import Any, Callable
@@ -54,7 +59,7 @@ def _rows(frame, limit: int = 0) -> list[dict[str, Any]]:
     if frame is None or getattr(frame, "empty", True):
         return []
     view = frame.head(limit) if limit else frame
-    return view.where(view.notna(), None).to_dict(orient="records")
+    return view.astype(object).where(view.notna(), None).to_dict(orient="records")
 
 
 class DesktopDashboard(tk.Tk):
@@ -67,11 +72,15 @@ class DesktopDashboard(tk.Tk):
         self.minsize(920, 620)
         self.smoke = smoke
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="nepse-ui")
+        self.heavy_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="nepse-heavy")
         self.ui_events: queue.SimpleQueue = queue.SimpleQueue()
         self.jobs: dict[str, Any] = {}
         self.pages: dict[str, tk.Frame] = {}
         self.tables: dict[str, ttk.Treeview] = {}
         self.table_columns: dict[str, tuple[str, ...]] = {}
+        self.table_rows: dict[str, list[dict[str, Any]]] = {}
+        self.table_pages: dict[str, int] = {}
+        self.table_pagers: dict[str, tuple[ttk.Label, ttk.Button, ttk.Button]] = {}
         self.status_vars: dict[str, tk.StringVar] = {}
         self.detail_widgets: dict[str, tk.Text] = {}
         self.loaded: set[str] = set()
@@ -83,6 +92,9 @@ class DesktopDashboard(tk.Tk):
         self.engine_threads_by_id: dict[str, threading.Thread] = {}
         self.research_cancel: threading.Event | None = None
         self.research_result: dict[str, Any] | None = None
+        self.history_cancel_file: Path | None = None
+        self.history_update_running = False
+        self.history_errors: list[str] = []
         self.strategy_payloads: dict[str, dict[str, Any]] = {}
         self.account_var = tk.StringVar(value="Loading accounts…")
         self.app_status = tk.StringVar(value="Ready")
@@ -99,31 +111,38 @@ class DesktopDashboard(tk.Tk):
 
     def _build_shell(self) -> None:
         style = ttk.Style(self)
-        style.configure("TNotebook.Tab", padding=(8, 4))
-        style.configure("Treeview", rowheight=22)
+        style.configure("TNotebook.Tab", padding=(11, 7))
+        style.configure("Treeview", rowheight=26)
         style.configure("Treeview.Heading", font=("TkDefaultFont", 9, "bold"))
+        style.configure("Navigation.Treeview", rowheight=31, borderwidth=0, relief="flat")
+        style.configure("PageTitle.TLabel", font=("TkDefaultFont", 17, "bold"))
+        style.configure("Brand.TLabel", font=("TkDefaultFont", 15, "bold"))
+        self.theme_bg = style.lookup("TFrame", "background") or self.cget("background")
+        self.theme_fg = style.lookup("TLabel", "foreground") or self.cget("foreground")
 
-        header = ttk.Frame(self, padding=(10, 8, 10, 6))
+        header = ttk.Frame(self, padding=(16, 12, 16, 10))
         header.pack(fill="x")
-        ttk.Label(header, text="NEPSE QUANT", font=("TkDefaultFont", 15, "bold")).pack(side="left")
-        ttk.Label(header, text="PAPER TRADING", padding=(12, 0)).pack(side="left")
+        ttk.Label(header, text="NEPSE Quant", style="Brand.TLabel").pack(side="left")
+        ttk.Label(header, text="Paper trading and research", padding=(12, 0)).pack(side="left")
         self.account_picker = ttk.Combobox(header, textvariable=self.account_var, width=25, state="readonly")
         self.account_picker.pack(side="right", padx=(6, 0))
         self.account_picker.bind("<<ComboboxSelected>>", self._account_changed)
         ttk.Button(header, text="Refresh", command=lambda: self._load_page(self.current_page, force=True)).pack(side="right")
 
         body = ttk.Panedwindow(self, orient="horizontal")
-        body.pack(fill="both", expand=True, padx=8, pady=(0, 8))
-        nav = ttk.Frame(body, padding=(0, 0, 8, 0))
+        body.pack(fill="both", expand=True, padx=12, pady=(0, 10))
+        nav = ttk.Frame(body, padding=(0, 4, 12, 0), width=205)
         content = ttk.Frame(body)
         body.add(nav, weight=0)
         body.add(content, weight=1)
-        self.page_list = tk.Listbox(nav, width=22, exportselection=False, activestyle="dotbox", borderwidth=0, highlightthickness=0)
+        ttk.Label(nav, text="WORKSPACE", padding=(8, 2, 4, 9), font=("TkDefaultFont", 8, "bold")).pack(fill="x")
+        self.page_list = ttk.Treeview(nav, show="tree", selectmode="browse", style="Navigation.Treeview", height=len(PAGES))
+        self.page_list.column("#0", width=188, minwidth=150, stretch=True)
         for label in PAGES:
-            self.page_list.insert("end", label)
+            self.page_list.insert("", "end", iid=label, text=label)
         self.page_list.pack(fill="both", expand=True)
-        self.page_list.selection_set(0)
-        self.page_list.bind("<<ListboxSelect>>", self._page_selected)
+        self.page_list.selection_set(PAGES[0])
+        self.page_list.bind("<<TreeviewSelect>>", self._page_selected)
         self.content = content
         ttk.Separator(self, orient="horizontal").pack(fill="x")
         ttk.Label(self, textvariable=self.app_status, anchor="w", padding=(10, 4)).pack(fill="x")
@@ -244,13 +263,15 @@ class DesktopDashboard(tk.Tk):
                 self._finish_background(key, done, payload, error)
             elif event[0] == "research_progress":
                 self._research_progress(event[1])
+            elif event[0] == "history_progress":
+                self._history_progress(event[1], event[2], event[3])
         self.after(100, self._poll_ui_events)
 
     def _page_selected(self, _event=None) -> None:
-        selection = self.page_list.curselection()
+        selection = self.page_list.selection()
         if not selection:
             return
-        self.current_page = PAGES[selection[0]]
+        self.current_page = str(selection[0])
         self._load_current_page()
 
     def _account_changed(self, _event=None) -> None:
@@ -290,17 +311,52 @@ class DesktopDashboard(tk.Tk):
         ybar = ttk.Scrollbar(wrap, orient="vertical", command=table.yview)
         xbar = ttk.Scrollbar(wrap, orient="horizontal", command=table.xview)
         table.configure(yscrollcommand=ybar.set, xscrollcommand=xbar.set)
+        pager = ttk.Frame(wrap)
+        page_label = ttk.Label(pager, text="0 rows", anchor="center")
+        previous = ttk.Button(pager, text="Previous", command=lambda: self._change_table_page(name, -1))
+        next_page = ttk.Button(pager, text="Next", command=lambda: self._change_table_page(name, 1))
+        previous.pack(side="left")
+        page_label.pack(side="left", fill="x", expand=True, padx=8)
+        next_page.pack(side="right")
         table.grid(row=0, column=0, sticky="nsew")
         ybar.grid(row=0, column=1, sticky="ns")
         xbar.grid(row=1, column=0, sticky="ew")
+        pager.grid(row=2, column=0, sticky="ew", pady=(4, 0))
         wrap.rowconfigure(0, weight=1)
         wrap.columnconfigure(0, weight=1)
         self.tables[name] = table
+        self.table_rows[name] = []
+        self.table_pages[name] = 0
+        self.table_pagers[name] = (page_label, previous, next_page)
         return table
+
+    def _change_table_page(self, name: str, offset: int) -> None:
+        rows = self.table_rows.get(name, [])
+        pages = max(1, (len(rows) + 99) // 100)
+        self.table_pages[name] = min(max(self.table_pages.get(name, 0) + offset, 0), pages - 1)
+        self._show_table_page(name)
+
+    def _show_table_page(self, name: str) -> None:
+        table = self.tables.get(name)
+        if not table:
+            return
+        rows = self.table_rows.get(name, [])
+        page = self.table_pages.get(name, 0)
+        start, end = page * 100, min((page + 1) * 100, len(rows))
+        table.delete(*table.get_children())
+        keys = self.table_columns[name]
+        for row in rows[start:end]:
+            values = [row.get(key, "") for key in keys]
+            table.insert("", "end", values=tuple("" if value is None else value for value in values))
+        label, previous, next_page = self.table_pagers[name]
+        label.configure(text=f"{start + 1:,}–{end:,} of {len(rows):,}" if rows else "No rows")
+        previous.configure(state="normal" if page > 0 else "disabled")
+        next_page.configure(state="normal" if end < len(rows) else "disabled")
 
     def _detail(self, parent, name: str, height: int = 7) -> tk.Text:
         widget = tk.Text(parent, height=height, wrap="word", undo=False)
         widget.pack(fill="both", expand=True, pady=(6, 0))
+        widget.configure(background=self.theme_bg, foreground=self.theme_fg, insertbackground=self.theme_fg, borderwidth=0, relief="flat")
         widget.configure(state="disabled")
         self.detail_widgets[name] = widget
         return widget
@@ -315,24 +371,50 @@ class DesktopDashboard(tk.Tk):
         widget.configure(state="disabled")
 
     def _populate(self, name: str, rows: list[dict[str, Any]], *, status: str = "", detail: str = "") -> None:
-        table = self.tables.get(name)
-        if table:
-            table.delete(*table.get_children())
-            keys = self.table_columns[name]
-            for row in rows:
-                values = [row.get(key, "") for key in keys]
-                table.insert("", "end", values=tuple("" if value is None else value for value in values))
+        if name in self.tables:
+            self.table_rows[name] = rows
+            self.table_pages[name] = 0
+            self._show_table_page(name)
         if name in self.status_vars:
             self.status_vars[name].set(status or f"{len(rows):,} rows")
         if detail:
             self._set_detail(name, detail)
 
     def _build_market(self, frame):
-        self._table(frame, "Market", (("symbol", "Symbol", 110), ("close", "Close", 100), ("chg", "Change %", 100), ("volume", "Volume", 110), ("turn", "Turnover", 120)), height=24)
+        toolbar = ttk.Frame(frame)
+        toolbar.pack(fill="x", pady=(0, 6))
+        self.market_scope = tk.StringVar(value="Current session")
+        ttk.Label(toolbar, text="View").pack(side="left", padx=(0, 4))
+        self.market_scope_picker = ttk.Combobox(
+            toolbar, textvariable=self.market_scope,
+            values=("Current session", "All stored symbols"), width=21, state="readonly",
+        )
+        self.market_scope_picker.pack(side="left")
+        self.market_scope_picker.bind("<<ComboboxSelected>>", lambda _event: self._load_page("Market", force=True))
+        self.history_update_button = ttk.Button(toolbar, text="Update history", command=self._start_history_update)
+        self.history_update_button.pack(side="left", padx=(10, 4))
+        self.history_cancel_button = ttk.Button(toolbar, text="Cancel update", command=self._cancel_history_update, state="disabled")
+        self.history_cancel_button.pack(side="left")
+        self.history_error_button = ttk.Button(toolbar, text="Update errors", command=self._show_history_errors, state="disabled")
+        self.history_error_button.pack(side="right")
+
+        self.market_health = tk.StringVar(value="Checking local price and quote coverage…")
+        ttk.Label(frame, textvariable=self.market_health, justify="left", anchor="w", wraplength=1000).pack(fill="x", pady=(0, 4))
+        self.history_status = tk.StringVar(value="History updates run only when started.")
+        ttk.Label(frame, textvariable=self.history_status, anchor="w").pack(fill="x")
+        self.history_progress = ttk.Progressbar(frame, maximum=100, mode="determinate")
+        self.history_progress.pack(fill="x", pady=(2, 7))
+        self._table(frame, "Market", (("symbol", "Symbol", 100), ("date", "Last Date", 95), ("close", "Close", 90), ("chg", "Change %", 90), ("volume", "Volume", 100), ("turn", "Turnover", 115)), height=20)
 
     def _build_portfolio(self, frame):
-        self._table(frame, "Portfolio", (("symbol", "Symbol", 100), ("shares", "Shares", 80), ("entry", "Entry", 90), ("last", "Last", 90), ("value", "Market Value", 130), ("pnl", "Unrealized P/L", 125), ("pnl_pct", "P/L %", 80)), height=18)
-        self._detail(frame, "Portfolio", height=8)
+        tabs = ttk.Notebook(frame)
+        tabs.pack(fill="both", expand=True)
+        holdings = ttk.Frame(tabs, padding=4)
+        trades = ttk.Frame(tabs, padding=4)
+        tabs.add(holdings, text="Holdings")
+        tabs.add(trades, text="Trade history")
+        self._table(holdings, "Portfolio", (("symbol", "Symbol", 100), ("shares", "Shares", 80), ("entry", "Entry", 90), ("last", "Last", 90), ("value", "Market Value", 130), ("pnl", "Unrealized P/L", 125), ("pnl_pct", "P/L %", 80)), height=18)
+        self._table(trades, "Portfolio trades", (("date", "Date", 125), ("symbol", "Symbol", 90), ("action", "Action", 70), ("quantity", "Shares", 80), ("price", "Price", 95), ("pnl", "Net P/L", 100), ("reason", "Reason", 220)), height=18)
 
     def _build_signals(self, frame):
         self._table(frame, "Signals", (("symbol", "Symbol", 100), ("signal", "Signal", 150), ("strength", "Strength", 90), ("confidence", "Confidence", 95), ("score", "Score", 80), ("reason", "Reason", 420)), height=24)
@@ -382,6 +464,7 @@ class DesktopDashboard(tk.Tk):
         row.pack(fill="x", pady=(0, 6))
         ttk.Button(row, text="Fetch latest", command=lambda: self._load_page("Rates & Commodities", force=True)).pack(side="left")
         self._table(frame, "Rates & Commodities", (("item", "Market", 180), ("price", "Price", 120), ("change", "Change", 100), ("unit", "Unit", 100), ("date", "As of", 140)), height=24)
+        self._detail(frame, "Rates & Commodities", height=3)
 
     def _build_account(self, frame):
         row = ttk.Frame(frame)
@@ -414,7 +497,7 @@ class DesktopDashboard(tk.Tk):
         split.add(right, weight=2)
         self._table(left, "Strategies", (("id", "ID", 115), ("name", "Name", 180), ("source", "Source", 80), ("hold", "Hold", 60), ("signals", "Signals", 190)), height=22)
         self.tables["Strategies"].bind("<<TreeviewSelect>>", self._strategy_selected)
-        self.strategy_editor = tk.Text(right, wrap="none", undo=True)
+        self.strategy_editor = tk.Text(right, wrap="none", undo=True, background=self.theme_bg, foreground=self.theme_fg, insertbackground=self.theme_fg, borderwidth=0, relief="flat")
         self.strategy_editor.pack(fill="both", expand=True)
         self._detail(right, "Strategy result", height=6)
 
@@ -441,7 +524,7 @@ class DesktopDashboard(tk.Tk):
         self.research_progress.pack(fill="x", pady=(0, 5))
         self.research_metrics = tk.StringVar(value="Baseline   —\nModel      —\nNEPSE      —")
         ttk.Label(frame, textvariable=self.research_metrics, justify="left", anchor="w").pack(fill="x", pady=(0, 5))
-        self.research_chart = tk.Canvas(frame, height=185, background="white", highlightthickness=1, highlightbackground="#c8c8c8")
+        self.research_chart = tk.Canvas(frame, height=185, background=self.theme_bg, highlightthickness=1, highlightbackground=self.theme_fg)
         self.research_chart.pack(fill="x", pady=(0, 5))
         self.research_chart.bind("<Configure>", lambda _event: self._draw_research_chart())
         result_tabs = ttk.Notebook(frame)
@@ -454,8 +537,11 @@ class DesktopDashboard(tk.Tk):
         self._table(trades, "Research trades", (("portfolio", "Portfolio", 90), ("symbol", "Symbol", 80), ("signal_date", "Signal", 90), ("entry_date", "Entry", 90), ("entry_price", "Entry Price", 95), ("exit_date", "Exit", 90), ("exit_price", "Exit Price", 95), ("shares", "Shares", 70), ("net_pnl", "Net P/L", 100), ("net_return_pct", "Net %", 80), ("exit_reason", "Exit reason", 125)), height=8)
 
     def _build_page(self, name: str) -> tk.Frame:
-        frame = ttk.Frame(self.content, padding=8)
+        frame = ttk.Frame(self.content, padding=(14, 10, 12, 8))
         self.status_vars[name] = tk.StringVar(value="Select Refresh to load")
+        heading = ttk.Frame(frame)
+        heading.pack(fill="x", pady=(0, 9))
+        ttk.Label(heading, text=name, style="PageTitle.TLabel").pack(anchor="w")
         build = getattr(self, f"_build_{name.lower().replace(' ', '_').replace('&', 'and')}", None)
         if build:
             build(frame)
@@ -478,21 +564,32 @@ class DesktopDashboard(tk.Tk):
             "Strategies": self._load_strategies,
             "Model Research": None,
         }
-        if name in {"Lookup", "Model Research"}:
+        if name in {"Lookup", "Agents"} and not force:
             if name not in self.loaded:
                 self.loaded.add(name)
-                if name == "Model Research":
-                    self._set_research_status("Ready; choose a date range and run the comparison.")
+                if name == "Agents":
+                    self.status_vars[name].set("Ready · choose Run analysis when you need a fresh report.")
+            return
+        if name == "Model Research":
+            self.loaded.add(name)
+            self._background("research_restore", self._load_saved_research, self._restore_saved_research)
+            return
+        if name == "Lookup":
+            self.loaded.add(name)
             return
         self.status_vars[name].set("Loading…")
         if name == "Rates & Commodities":
             self.status_vars[name].set("Fetching market rates…")
         account_id = self.current_account_id
+        market_scope = self.market_scope.get() if name == "Market" else None
         if name in {"Portfolio", "Signals", "Orders", "Watchlist"}:
             loader = lambda: loaders[name](account_id)
+        elif name == "Market":
+            loader = lambda: self._load_market(market_scope)
         else:
             loader = loaders[name]
-        self._background(f"load:{name}", loader, lambda payload: self._loaded_page(name, payload))
+        heavy = name in {"Signals", "Agents", "Rates & Commodities", "Strategies"}
+        self._background(f"load:{name}", loader, lambda payload: self._loaded_page(name, payload), heavy=heavy)
         self.jobs[name] = True
 
     def _loaded_page(self, name: str, payload: dict[str, Any]) -> None:
@@ -504,20 +601,25 @@ class DesktopDashboard(tk.Tk):
         self.loaded.add(name)
         if name == "Market":
             self._populate(name, payload["rows"], status=payload["summary"])
+            self.market_health.set(payload["health"])
         elif name == "Portfolio":
-            self._populate(name, payload["rows"], status=payload["summary"], detail=payload["detail"])
+            self._populate(name, payload["rows"], status=payload["summary"])
+            self._populate("Portfolio trades", payload["trades"], status=f"{len(payload['trades']):,} paper trades")
         elif name == "Signals":
             self._populate(name, payload["rows"], status=payload["status"])
         elif name == "Lookup":
             self._populate(name, payload["rows"], status=payload["status"], detail=payload["detail"])
         elif name == "Agents":
             self._populate(name, payload["rows"], status=payload["status"], detail=payload["detail"])
+        elif name == "Rates & Commodities":
+            self._populate(name, payload["rows"], status=payload["status"], detail=payload.get("detail", ""))
         else:
             self._populate(name, payload["rows"], status=payload.get("status", ""))
         self.app_status.set(f"{name} updated")
 
-    def _background(self, key: str, work: Callable[[], Any], done: Callable[[Any], None]) -> None:
-        future = self.executor.submit(work)
+    def _background(self, key: str, work: Callable[[], Any], done: Callable[[Any], None], *, heavy: bool = False) -> None:
+        executor = self.heavy_executor if heavy else self.executor
+        future = executor.submit(work)
         self.jobs[key] = future
 
         def finished(result):
@@ -545,6 +647,12 @@ class DesktopDashboard(tk.Tk):
                 self.research_cancel_button.configure(state="disabled")
                 self._set_research_status(f"Research failed: {error}")
                 return
+            if key == "history_update":
+                self._history_update_failed(error)
+                return
+            if key == "research_restore":
+                self._set_research_status(f"Could not load saved results: {error}")
+                return
             if target in self.status_vars:
                 self.status_vars[target].set(f"Error: {error}")
             self.app_status.set(f"{target}: {error}")
@@ -553,22 +661,259 @@ class DesktopDashboard(tk.Tk):
             done(payload)
 
     def _auto_refresh(self):
-        if not self.smoke and not self.research_cancel:
+        if not self.smoke and not self.research_cancel and not self.history_update_running and self.current_page not in {"Signals", "Agents", "Rates & Commodities", "Strategies", "Model Research"}:
             self.loaded.discard(self.current_page)
             self._load_page(self.current_page, force=True)
         self.after(60_000, self._auto_refresh)
 
-    def _load_market(self):
+    @staticmethod
+    def _market_coverage(db_path: Path) -> str:
+        conn = sqlite3.connect(str(db_path))
+        try:
+            latest_price = conn.execute(
+                "SELECT MAX(date) FROM stock_prices WHERE symbol!='NEPSE' AND symbol NOT LIKE 'SECTOR::%'"
+            ).fetchone()[0]
+            benchmark = conn.execute("SELECT MAX(date) FROM stock_prices WHERE symbol='NEPSE'").fetchone()[0]
+            stored_count = conn.execute(
+                "SELECT COUNT(DISTINCT symbol) FROM stock_prices WHERE symbol!='NEPSE' AND symbol NOT LIKE 'SECTOR::%'"
+            ).fetchone()[0]
+            current_count = conn.execute(
+                "SELECT COUNT(DISTINCT symbol) FROM stock_prices WHERE date=? AND symbol!='NEPSE' AND symbol NOT LIKE 'SECTOR::%'",
+                (latest_price,),
+            ).fetchone()[0] if latest_price else 0
+            quote_ts, quote_count = conn.execute(
+                "SELECT fetched_at_utc,COUNT(DISTINCT symbol) FROM market_quotes "
+                "WHERE fetched_at_utc=(SELECT MAX(fetched_at_utc) FROM market_quotes)"
+            ).fetchone()
+            months = set()
+            if latest_price:
+                latest = date.fromisoformat(str(latest_price))
+                latest_key = latest.year * 12 + latest.month - 1
+                first_key = latest_key - 11
+                first_month = f"{first_key // 12:04d}-{first_key % 12 + 1:02d}-01"
+                months = {
+                    row[0]
+                    for row in conn.execute(
+                        "SELECT DISTINCT substr(date,1,7) FROM stock_prices "
+                        "WHERE date>=? AND symbol!='NEPSE' AND symbol NOT LIKE 'SECTOR::%'",
+                        (first_month,),
+                    )
+                }
+                first_date = conn.execute(
+                    "SELECT MIN(date) FROM stock_prices WHERE symbol!='NEPSE' AND symbol NOT LIKE 'SECTOR::%'"
+                ).fetchone()[0]
+                first_key = max(first_key, date.fromisoformat(str(first_date)).year * 12 + date.fromisoformat(str(first_date)).month - 1)
+                month_keys = [f"{key // 12:04d}-{key % 12 + 1:02d}" for key in range(first_key, latest_key + 1)]
+                missing = [month for month in month_keys if month not in months and month != f"{latest.year:04d}-{latest.month:02d}"]
+            else:
+                missing = []
+        finally:
+            conn.close()
+
+        quote_label = "no cached quotes"
+        if quote_ts:
+            try:
+                local_ts = datetime.fromisoformat(str(quote_ts).replace("Z", "+00:00")).astimezone(
+                    timezone(timedelta(hours=5, minutes=45))
+                )
+                quote_label = f"{quote_count} symbols at {local_ts:%Y-%m-%d %H:%M} NPT"
+            except ValueError:
+                quote_label = f"{quote_count} symbols at {quote_ts}"
+        month_label = ", ".join(missing) if missing else "none in the last 12 months"
+        return (
+            f"Price bars: {latest_price or 'none'} · {current_count:,} symbols in that session · {stored_count:,} stored; "
+            f"NEPSE index: {benchmark or 'none'}; quotes: {quote_label}.\n"
+            f"Months without price bars in the recent history: {month_label}."
+        )
+
+    def _load_all_stored_market(self) -> list[dict[str, Any]]:
+        conn = sqlite3.connect(str(self._db_path()))
+        try:
+            raw = conn.execute(
+                """SELECT latest.symbol,latest.date,latest.close,latest.volume,
+                          (SELECT prior.close FROM stock_prices prior
+                           WHERE prior.symbol=latest.symbol AND prior.date<latest.date
+                           ORDER BY prior.date DESC LIMIT 1),
+                          (SELECT prior.date FROM stock_prices prior
+                           WHERE prior.symbol=latest.symbol AND prior.date<latest.date
+                           ORDER BY prior.date DESC LIMIT 1)
+                   FROM stock_prices latest
+                   JOIN (SELECT symbol,MAX(date) date FROM stock_prices
+                         WHERE symbol!='NEPSE' AND symbol NOT LIKE 'SECTOR::%' GROUP BY symbol) most_recent
+                     ON latest.symbol=most_recent.symbol AND latest.date=most_recent.date
+                   ORDER BY latest.symbol"""
+            ).fetchall()
+        finally:
+            conn.close()
+        rows = []
+        for symbol, last_date, close, volume, previous, previous_date in raw:
+            change = None
+            if previous and previous_date and (date.fromisoformat(str(last_date)) - date.fromisoformat(str(previous_date))).days <= 14:
+                change = (float(close) - float(previous)) / float(previous) * 100 if float(previous) else None
+            rows.append({
+                "symbol": symbol, "date": last_date, "close": close, "chg": change,
+                "volume": volume, "turn": float(close or 0) * float(volume or 0),
+            })
+        return rows
+
+    def _load_market(self, scope: str = "Current session"):
         from backend.quant_pro.dashboard_data import MD
 
-        market = MD(top_n=40)
-        frame = market.df.copy()
-        if frame.empty or not set(("symbol", "close", "chg", "volume", "turn")).issubset(frame.columns):
-            return {"rows": [], "summary": f"Market data unavailable · {market.err or 'No cached session'}"}
-        if not frame.empty:
-            frame = frame.sort_values("chg", ascending=False)
-        summary = f"Session {market.latest}    NEPSE breadth: {market.adv} up / {market.dec} down / {market.unch} unchanged"
-        return {"rows": _rows(frame[["symbol", "close", "chg", "volume", "turn"]], 100), "summary": summary}
+        market = MD(top_n=0)
+        if scope == "All stored symbols":
+            rows = self._load_all_stored_market()
+            summary = f"{len(rows):,} symbols · latest stored price for each; unavailable changes are left blank"
+        else:
+            frame = market.df.copy()
+            if frame.empty or not set(("symbol", "close", "chg", "volume", "turn")).issubset(frame.columns):
+                rows = []
+                summary = f"Market data unavailable · {market.err or 'No cached session'}"
+            else:
+                frame = frame.sort_values("chg", ascending=False, na_position="last")
+                frame["date"] = market.latest
+                rows = _rows(frame[["symbol", "date", "close", "chg", "volume", "turn"]])
+                summary = (
+                    f"Session {market.latest} · {len(rows):,} symbols · daily change available for {market.adv + market.dec + market.unch:,}; "
+                    f"{len(rows) - market.adv - market.dec - market.unch:,} unavailable"
+                )
+        return {"rows": rows, "summary": summary, "health": self._market_coverage(self._db_path())}
+
+    def _start_history_update(self) -> None:
+        if self.history_update_running:
+            return
+        cancel_file = Path(tempfile.gettempdir()) / f"nepse-ingestion-{os.getpid()}-{uuid.uuid4().hex}.cancel"
+        self.history_cancel_file = cancel_file
+        self.history_update_running = True
+        self.history_errors = []
+        self.history_update_button.configure(state="disabled")
+        self.history_cancel_button.configure(state="normal")
+        self.history_error_button.configure(state="disabled")
+        self.history_progress.configure(mode="indeterminate")
+        self.history_progress.start(12)
+        self.history_status.set("Starting the historical price update…")
+        self._background("history_update", lambda: self._run_history_update(cancel_file), self._history_update_finished, heavy=True)
+
+    def _run_history_update(self, cancel_file: Path) -> dict[str, Any]:
+        script = Path(__file__).resolve().parents[2] / "scripts" / "ingestion" / "deterministic_daily_ingestion.py"
+        command = [sys.executable, "-u", str(script), "--source", "both", "--cancel-file", str(cancel_file)]
+        lines: list[str] = []
+        run_id = None
+        progress = re.compile(r"\[(\d+)/(\d+)\]")
+        with subprocess.Popen(
+            command,
+            cwd=str(script.parents[2]),
+            env={**os.environ, "PYTHONUNBUFFERED": "1"},
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        ) as process:
+            assert process.stdout is not None
+            for raw_line in process.stdout:
+                line = raw_line.rstrip()
+                if not line:
+                    continue
+                lines.append(line)
+                if len(lines) > 30:
+                    del lines[0]
+                started = re.search(r"started run_id=(\d+)", line)
+                if started:
+                    run_id = int(started.group(1))
+                step = progress.search(line)
+                if step:
+                    self.ui_events.put(("history_progress", int(step.group(1)), int(step.group(2)), line))
+            return_code = process.wait()
+
+        status, succeeded, failed, fetched, latest = "FAILED", 0, 0, 0, "unknown"
+        errors: list[str] = []
+        if run_id is not None:
+            conn = sqlite3.connect(str(self._db_path()))
+            try:
+                row = conn.execute(
+                    "SELECT status,symbols_succeeded,symbols_failed,rows_fetched,latest_market_date_after "
+                    "FROM ingestion_runs WHERE run_id=?", (run_id,),
+                ).fetchone()
+                if row:
+                    status, succeeded, failed, fetched, latest = row
+                errors = [f"{symbol}: {error or 'failed without a reason'}" for symbol, error in conn.execute(
+                    "SELECT symbol,error FROM ingestion_run_symbols WHERE run_id=? AND status='FAILED' ORDER BY symbol",
+                    (run_id,),
+                )]
+            finally:
+                conn.close()
+        try:
+            cancel_file.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return {
+            "return_code": return_code, "status": status, "succeeded": succeeded,
+            "failed": failed, "rows_fetched": fetched, "latest": latest,
+            "errors": errors, "output": lines,
+        }
+
+    def _history_progress(self, completed: int, total: int, line: str) -> None:
+        self.history_progress.stop()
+        self.history_progress.configure(mode="determinate", maximum=max(1, total), value=completed)
+        self.history_status.set(f"{completed:,} of {total:,} symbols · {line}")
+
+    def _finish_history_update_controls(self) -> None:
+        self.history_update_running = False
+        self.history_cancel_file = None
+        self.history_progress.stop()
+        self.history_progress.configure(mode="determinate", value=0)
+        self.history_update_button.configure(state="normal")
+        self.history_cancel_button.configure(state="disabled")
+
+    def _history_update_finished(self, result: dict[str, Any]) -> None:
+        self._finish_history_update_controls()
+        self.history_errors = result["errors"]
+        self.history_error_button.configure(state="normal" if self.history_errors else "disabled")
+        status = result["status"]
+        self.history_status.set(
+            f"{status.title()} · {result['succeeded']:,} succeeded, {result['failed']:,} failed · "
+            f"{result['rows_fetched']:,} rows · latest price date {result['latest']}"
+        )
+        if result["return_code"] and not result["errors"]:
+            self.history_errors = result["output"]
+            self.history_error_button.configure(state="normal")
+        self.app_status.set(f"Price history update {status.lower()}")
+        for page in ("Market", "Signals", "Portfolio", "Watchlist", "Account", "Lookup"):
+            self.loaded.discard(page)
+        if "Market" in self.pages:
+            self._load_page("Market", force=True)
+        if self.current_page in {"Signals", "Portfolio", "Watchlist", "Account"}:
+            self._load_page(self.current_page, force=True)
+
+    def _history_update_failed(self, error: Exception) -> None:
+        self._finish_history_update_controls()
+        self.history_status.set(f"History update failed: {error}")
+        self.app_status.set(f"History update failed: {error}")
+
+    def _cancel_history_update(self) -> None:
+        if self.history_cancel_file:
+            self.history_cancel_file.write_text("cancel", encoding="utf-8")
+            self.history_cancel_button.configure(state="disabled")
+            self.history_status.set("Cancellation requested · the current symbol will finish first.")
+
+    def _show_history_errors(self) -> None:
+        if not self.history_errors:
+            return
+        window = tk.Toplevel(self)
+        window.title("History update details")
+        window.geometry("760x440")
+        body = ttk.Frame(window, padding=8)
+        body.pack(fill="both", expand=True)
+        text = tk.Text(body, wrap="none", undo=False, background=self.theme_bg, foreground=self.theme_fg, insertbackground=self.theme_fg, borderwidth=0, relief="flat")
+        ybar = ttk.Scrollbar(body, orient="vertical", command=text.yview)
+        xbar = ttk.Scrollbar(body, orient="horizontal", command=text.xview)
+        text.configure(yscrollcommand=ybar.set, xscrollcommand=xbar.set)
+        text.insert("1.0", "\n".join(self.history_errors))
+        text.configure(state="disabled")
+        text.grid(row=0, column=0, sticky="nsew")
+        ybar.grid(row=0, column=1, sticky="ns")
+        xbar.grid(row=1, column=0, sticky="ew")
+        body.rowconfigure(0, weight=1)
+        body.columnconfigure(0, weight=1)
 
     def _load_portfolio(self, account_id: str):
         import pandas as pd
@@ -581,10 +926,20 @@ class DesktopDashboard(tk.Tk):
             value = position.shares * last
             pnl = value - position.shares * position.entry_price - position.buy_fees
             rows.append({"symbol": position.symbol, "shares": position.shares, "entry": position.entry_price, "last": last, "value": value, "pnl": pnl, "pnl_pct": 100 * pnl / max(1, position.shares * position.entry_price)})
-        trades = pd.read_csv(service.trade_log_file).tail(10) if service.trade_log_file.exists() else pd.DataFrame()
-        detail = "Recent paper trades\n" + (trades.to_string(index=False) if not trades.empty else "No trades recorded.")
+        trades = pd.read_csv(service.trade_log_file) if service.trade_log_file.exists() else pd.DataFrame()
+        trade_rows = []
+        for row in _rows(trades.iloc[::-1] if not trades.empty else trades):
+            trade_rows.append({
+                "date": row.get("Date", row.get("date")),
+                "symbol": row.get("Symbol", row.get("symbol")),
+                "action": row.get("Action", row.get("action")),
+                "quantity": row.get("Shares", row.get("shares", row.get("quantity"))),
+                "price": row.get("Price", row.get("price")),
+                "pnl": row.get("PnL", row.get("pnl")),
+                "reason": row.get("Reason", row.get("reason")),
+            })
         summary = f"{self._account(account_id)['name']}  |  Cash NPR {state['cash']:,.0f}  |  NAV NPR {state['nav']:,.0f}  |  {len(rows)} positions"
-        return {"rows": rows, "summary": summary, "detail": detail, "account_id": account_id}
+        return {"rows": rows, "trades": trade_rows, "summary": summary, "account_id": account_id}
 
     def _load_signals(self, account_id: str):
         from backend.backtesting.simple_backtest import load_all_prices
@@ -626,7 +981,7 @@ class DesktopDashboard(tk.Tk):
 
     def _load_orders(self, account_id: str):
         state = self._service(account_id).get_account_execution_state()
-        return {"rows": list(state["open_orders"]) + list(state["order_history"][-100:]), "status": f"{len(state['open_orders'])} open paper orders · no broker connection", "account_id": account_id}
+        return {"rows": list(state["open_orders"]) + list(state["order_history"]), "status": f"{len(state['open_orders'])} open paper orders · no broker connection", "account_id": account_id}
 
     def _load_watchlist(self, account_id: str):
         path = self.account_dirs[account_id] / "watchlist.json"
@@ -657,24 +1012,43 @@ class DesktopDashboard(tk.Tk):
         )
         from backend.market.kalimati_market import init_kalimati_db, refresh_kalimati
 
-        init_kalimati_db()
-        commodities, status = refresh_kalimati()
-        rows = [{"item": row.get("name_english"), "price": row.get("avg"), "change": row.get("change_pct"), "unit": row.get("unit"), "date": row.get("date")} for row in commodities]
-        metals = _fetch_gold_silver_prices() or {}
-        for label in ("gold", "silver"):
-            price = metals.get(f"{label}_per_tola")
-            if price:
-                rows.append({"item": label.title(), "price": price, "change": "", "unit": "NPR/tola", "date": metals.get("date_bs", "")})
-        noc = _fetch_noc_fuel_prices() or {}
-        for key, label in (("petrol", "Petrol"), ("diesel", "Diesel"), ("kerosene", "Kerosene"), ("lpg", "LPG")):
-            if noc.get(key):
-                rows.append({"item": f"NOC {label}", "price": noc[key], "change": "", "unit": "NPR/litre" if key != "lpg" else "NPR/cylinder", "date": noc.get("date_bs", "")})
-        for record in (_fetch_yahoo_futures_price("CL=F", "Crude oil"), _fetch_yahoo_futures_price("GC=F", "Gold futures")):
-            if record:
-                rows.append({"item": record.get("label") or record.get("name", "Global rate"), "price": record.get("value"), "change": record.get("change_pct", ""), "unit": record.get("unit", ""), "date": record.get("date", "")})
-        for record in _fetch_nrb_forex_rates():
-            rows.append({"item": f"NPR / {record.get('currency_code', '')}", "price": record.get("sell_rate") or record.get("buy_rate"), "change": record.get("change_pct", ""), "unit": record.get("currency_name", ""), "date": record.get("date", "")})
-        return {"rows": rows, "status": status or f"{len(rows)} market rates"}
+        rows, errors = [], []
+        status = ""
+        try:
+            init_kalimati_db()
+            commodities, status = refresh_kalimati()
+            rows.extend({"item": row.get("name_english"), "price": row.get("avg"), "change": row.get("change_pct"), "unit": row.get("unit"), "date": row.get("date")} for row in commodities)
+        except Exception as exc:
+            errors.append(f"Kalimati: {exc}")
+        try:
+            metals = _fetch_gold_silver_prices() or {}
+            for label in ("gold", "silver"):
+                price = metals.get(f"{label}_per_tola")
+                if price:
+                    rows.append({"item": label.title(), "price": price, "change": "", "unit": "NPR/tola", "date": metals.get("date_bs", "")})
+        except Exception as exc:
+            errors.append(f"Gold and silver: {exc}")
+        try:
+            noc = _fetch_noc_fuel_prices() or {}
+            for key, label in (("petrol", "Petrol"), ("diesel", "Diesel"), ("kerosene", "Kerosene"), ("lpg", "LPG")):
+                if noc.get(key):
+                    rows.append({"item": f"NOC {label}", "price": noc[key], "change": "", "unit": "NPR/litre" if key != "lpg" else "NPR/cylinder", "date": noc.get("date_bs", "")})
+        except Exception as exc:
+            errors.append(f"NOC fuel: {exc}")
+        for symbol, label in (("CL=F", "Crude oil"), ("GC=F", "Gold futures")):
+            try:
+                record = _fetch_yahoo_futures_price(symbol, label)
+                if record:
+                    rows.append({"item": record.get("label") or record.get("name", "Global rate"), "price": record.get("value"), "change": record.get("change_pct", ""), "unit": record.get("unit", ""), "date": record.get("date", "")})
+            except Exception as exc:
+                errors.append(f"{label}: {exc}")
+        try:
+            for record in _fetch_nrb_forex_rates():
+                rows.append({"item": f"NPR / {record.get('currency_code', '')}", "price": record.get("sell_rate") or record.get("buy_rate"), "change": record.get("change_pct", ""), "unit": record.get("currency_name", ""), "date": record.get("date", "")})
+        except Exception as exc:
+            errors.append(f"NRB forex: {exc}")
+        summary = f"{len(rows)} market rates" + (f" · {len(errors)} sources unavailable" if errors else "")
+        return {"rows": rows, "status": " · ".join(filter(None, (status, summary))), "detail": "\n".join(errors)}
 
     def _load_accounts(self):
         rows = []
@@ -695,6 +1069,21 @@ class DesktopDashboard(tk.Tk):
         return {"rows": [{"id": row["id"], "name": row.get("name"), "source": row.get("source"), "hold": (row.get("config") or {}).get("holding_days"), "signals": ", ".join((row.get("config") or {}).get("signal_types") or [])} for row in payloads], "status": f"{len(payloads)} strategies · select one to inspect or backtest"}
 
     @staticmethod
+    def _load_saved_research():
+        from backend.quant_pro.paths import get_data_dir
+
+        target = get_data_dir(__file__) / "model_research" / "latest.json"
+        return json.loads(target.read_text(encoding="utf-8")) if target.exists() else None
+
+    def _restore_saved_research(self, payload):
+        if payload:
+            self.research_result = payload
+            self._render_research(payload)
+            self._set_research_status(f"Loaded saved results · {(payload.get('settings') or {}).get('out_of_sample_start_date', 'date unavailable')}")
+        else:
+            self._set_research_status("No saved comparison yet; choose a date range and run one.")
+
+    @staticmethod
     def _db_path() -> Path:
         from backend.quant_pro.database import get_db_path
 
@@ -709,7 +1098,7 @@ class DesktopDashboard(tk.Tk):
             from backend.quant_pro.dashboard_data import MD
             from backend.quant_pro.stock_report import build_stock_report
 
-            detail = MD(top_n=0).detail(symbol, limit=40)
+            detail = MD(top_n=0).detail(symbol, limit=None)
             if not detail:
                 raise ValueError(f"No market history found for {symbol}")
             history = _rows(detail["h"])
@@ -957,7 +1346,7 @@ class DesktopDashboard(tk.Tk):
         if not start or not end:
             messagebox.showerror("Backtest", "Enter start and end dates.", parent=self)
             return
-        self._background("strategy_backtest", lambda: self._strategy_backtest(strategy_id, start, end), lambda result: self._set_detail("Strategy result", json.dumps(result, indent=2, default=str)))
+        self._background("strategy_backtest", lambda: self._strategy_backtest(strategy_id, start, end), lambda result: self._set_detail("Strategy result", json.dumps(result, indent=2, default=str)), heavy=True)
 
     @staticmethod
     def _strategy_backtest(strategy_id, start, end):
@@ -1014,7 +1403,7 @@ class DesktopDashboard(tk.Tk):
             payload["saved_to"] = str(target)
             target.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
             return payload
-        self._background("research", work, self._research_complete)
+        self._background("research", work, self._research_complete, heavy=True)
 
     def _research_progress(self, payload):
         if "progress_pct" in payload:
@@ -1054,7 +1443,7 @@ class DesktopDashboard(tk.Tk):
         self._populate("Research periods", payload.get("folds") or [], status=f"{len(payload.get('folds') or [])} non-overlapping test windows")
         trades = [{"portfolio": portfolio, **trade} for portfolio in ("Baseline", "Model") for trade in payload.get(f"{portfolio.lower()}_trades", [])]
         trades.sort(key=lambda row: row.get("signal_date", ""), reverse=True)
-        self._populate("Research trades", trades[:1000], status=f"Showing {min(len(trades), 1000):,} of {len(trades):,} trades; full data is in latest.json")
+        self._populate("Research trades", trades, status=f"{len(trades):,} trades · saved in latest.json")
 
     def _draw_research_chart(self, payload=None):
         payload = payload or self.research_result
@@ -1071,8 +1460,8 @@ class DesktopDashboard(tk.Tk):
         low, high = min(values), max(values)
         if high <= low:
             high = low + 0.01
-        canvas.create_line(pad, height - pad, width - 10, height - pad, fill="#bbbbbb")
-        canvas.create_line(pad, pad, pad, height - pad, fill="#bbbbbb")
+        canvas.create_line(pad, height - pad, width - 10, height - pad, fill=self.theme_fg)
+        canvas.create_line(pad, pad, pad, height - pad, fill=self.theme_fg)
         for index, (label, curve, color) in enumerate(series):
             if len(curve) < 2:
                 continue
@@ -1083,18 +1472,24 @@ class DesktopDashboard(tk.Tk):
                 coords.extend((x, y))
             canvas.create_line(*coords, fill=color, width=2, smooth=False)
             canvas.create_text(pad + 85 * index, 10, text=label, fill=color, anchor="w")
-        canvas.create_text(pad - 5, pad, text=f"{high:.2f}x", anchor="e", fill="#555555")
-        canvas.create_text(pad - 5, height - pad, text=f"{low:.2f}x", anchor="e", fill="#555555")
+        canvas.create_text(pad - 5, pad, text=f"{high:.2f}x", anchor="e", fill=self.theme_fg)
+        canvas.create_text(pad - 5, height - pad, text=f"{low:.2f}x", anchor="e", fill=self.theme_fg)
 
     def _close(self):
         if self.research_cancel:
             self.research_cancel.set()
+        if self.history_cancel_file:
+            try:
+                self.history_cancel_file.write_text("cancel", encoding="utf-8")
+            except OSError:
+                logging.getLogger(__name__).exception("Could not request history update cancellation")
         for engine in self.engines.values():
             try:
                 engine.stop()
             except Exception:
                 logging.getLogger(__name__).exception("Could not stop paper engine")
         self.executor.shutdown(wait=False, cancel_futures=True)
+        self.heavy_executor.shutdown(wait=False, cancel_futures=True)
         self.destroy()
 
 
@@ -1106,7 +1501,15 @@ def main() -> int:
     args = parser.parse_args()
     app = DesktopDashboard(smoke=args.smoke)
     if args.smoke:
-        valid = len(app.page_list.get(0, "end")) == len(PAGES) and len(app.pages) == len(PAGES) and len(app.tables) == 12
+        valid = len(app.page_list.get_children("")) == len(PAGES) and len(app.pages) == len(PAGES) and len(app.tables) == 13
+        app._populate("Signals", [{"symbol": f"SYM{i:03d}"} for i in range(205)])
+        valid = valid and len(app.tables["Signals"].get_children()) == 100
+        valid = valid and app.table_pagers["Signals"][0].cget("text") == "1–100 of 205"
+        app._change_table_page("Signals", 1)
+        valid = valid and len(app.tables["Signals"].get_children()) == 100
+        valid = valid and app.tables["Signals"].item(app.tables["Signals"].get_children()[0], "values")[0] == "SYM100"
+        app._change_table_page("Signals", 1)
+        valid = valid and len(app.tables["Signals"].get_children()) == 5
         app.destroy()
         if not valid:
             return 1

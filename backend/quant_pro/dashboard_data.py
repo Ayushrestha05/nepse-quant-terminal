@@ -41,51 +41,48 @@ class MD:
             ).drop_duplicates("symbol")
             for col in ("ltp", "prev_close", "pc", "vol"):
                 quotes[col] = pd.to_numeric(quotes[col], errors="coerce").fillna(0.0)
+            if not quotes.empty:
+                quotes["session"] = (
+                    pd.to_datetime(quotes["ts"], utc=True, errors="coerce")
+                    .add(pd.Timedelta(hours=5, minutes=45))
+                    .dt.strftime("%Y-%m-%d")
+                )
 
             lat_d = pd.read_sql_query(
                 "SELECT MAX(date) d FROM stock_prices WHERE symbol!='NEPSE'", c)["d"].iloc[0]
+            latest_price_date = str(lat_d) if pd.notna(lat_d) else None
+            sessions = quotes["session"].dropna() if "session" in quotes else pd.Series(dtype=object)
+            latest_quote_date = str(sessions.max()) if not sessions.empty else None
+            display_session = max(filter(None, (latest_price_date, latest_quote_date)), default=None)
             prv_d = None
-            if pd.notna(lat_d):
+            if latest_price_date:
                 prv_d = pd.read_sql_query(
                     "SELECT MAX(date) d FROM stock_prices WHERE symbol!='NEPSE' AND date<?",
-                    c, params=(lat_d,))["d"].iloc[0]
+                    c, params=(latest_price_date,))["d"].iloc[0]
 
-            if pd.notna(lat_d):
+            if latest_price_date == display_session and latest_price_date:
                 lat = pd.read_sql_query(
                     "SELECT symbol,open,high,low,close,volume FROM stock_prices WHERE date=?",
-                    c, params=(lat_d,))
+                    c, params=(latest_price_date,))
             else:
                 lat = pd.DataFrame(columns=["symbol", "open", "high", "low", "close", "volume"])
+            lat = lat[lat["symbol"] != "NEPSE"].drop_duplicates("symbol", keep="last")
 
-            lat = lat[lat["symbol"] != "NEPSE"].copy()
-            lat = lat.drop_duplicates("symbol", keep="last")
-            if not quotes.empty:
-                quote_fallback = quotes.rename(
+            current_quotes = quotes[quotes["session"] == display_session] if display_session and "session" in quotes else pd.DataFrame()
+            if current_quotes.empty:
+                quote_fallback = pd.DataFrame(columns=["symbol", "quote_ltp", "quote_prev", "quote_vol", "session"])
+            else:
+                quote_fallback = current_quotes.rename(
                     columns={"ltp": "quote_ltp", "prev_close": "quote_prev", "vol": "quote_vol"}
-                )[["symbol", "quote_ltp", "quote_prev", "quote_vol"]]
-            else:
-                quote_fallback = pd.DataFrame(columns=["symbol", "quote_ltp", "quote_prev", "quote_vol"])
+                )[["symbol", "quote_ltp", "quote_prev", "quote_vol", "session"]]
+            df = lat.merge(quote_fallback, on="symbol", how="outer")
 
-            if lat.empty and not quote_fallback.empty:
-                df = pd.DataFrame({
-                    "symbol": quote_fallback["symbol"],
-                    "open": quote_fallback["quote_ltp"],
-                    "high": quote_fallback["quote_ltp"],
-                    "low": quote_fallback["quote_ltp"],
-                    "close": quote_fallback["quote_ltp"],
-                    "volume": quote_fallback["quote_vol"],
-                })
-            else:
-                df = lat.copy()
-
-            if not quote_fallback.empty:
-                df = df.merge(quote_fallback, on="symbol", how="left")
-            else:
-                df["quote_ltp"] = pd.NA
-                df["quote_prev"] = pd.NA
-                df["quote_vol"] = pd.NA
-
-            if pd.notna(prv_d):
+            recent_price_baseline = (
+                latest_price_date == display_session
+                and pd.notna(prv_d)
+                and (pd.Timestamp(latest_price_date) - pd.Timestamp(prv_d)).days <= 14
+            )
+            if recent_price_baseline:
                 prv = pd.read_sql_query(
                     "SELECT symbol,close prev FROM stock_prices WHERE date=?",
                     c, params=(prv_d,))
@@ -98,26 +95,21 @@ class MD:
             for col in ("open", "high", "low", "close", "volume", "quote_ltp", "quote_prev", "quote_vol", "prev"):
                 df[col] = pd.to_numeric(df[col], errors="coerce")
 
-            df["close"] = df["close"].fillna(df["quote_ltp"])
+            quote_mark = df["session"] == display_session
+            df.loc[quote_mark, "close"] = df.loc[quote_mark, "quote_ltp"].fillna(df.loc[quote_mark, "close"])
             df["open"] = df["open"].fillna(df["close"])
             df["high"] = df["high"].fillna(df["close"])
             df["low"] = df["low"].fillna(df["close"])
             df["volume"] = df["volume"].fillna(df["quote_vol"]).fillna(0.0)
-            df["prev"] = df["prev"].fillna(df["quote_prev"])
+            quote_baseline = quote_mark & (df["quote_prev"] > 0)
+            df.loc[quote_baseline, "prev"] = df.loc[quote_baseline, "quote_prev"]
             prev_mask = df["prev"].fillna(0) > 0
-            df["chg"] = 0.0
+            df["chg"] = float("nan")
             df.loc[prev_mask, "chg"] = (df.loc[prev_mask, "close"] - df.loc[prev_mask, "prev"]) / df.loc[prev_mask, "prev"] * 100
             df["turn"] = df["close"].fillna(0.0) * df["volume"].fillna(0.0)
-            df = df.drop(columns=["quote_ltp", "quote_prev", "quote_vol"], errors="ignore")
+            df = df.drop(columns=["quote_ltp", "quote_prev", "quote_vol", "session"], errors="ignore")
 
-            display_session = lat_d
-            if pd.isna(display_session) and not quotes.empty and "ts" in quotes.columns:
-                try:
-                    display_session = pd.to_datetime(quotes["ts"].iloc[0]).strftime("%Y-%m-%d")
-                except Exception:
-                    display_session = "—"
-
-            self.latest = display_session if pd.notna(display_session) else "—"
+            self.latest = display_session or "—"
             self.prev_d = prv_d if pd.notna(prv_d) else "—"
             self.df = df
             filt = df[df["chg"].abs() <= 12]
@@ -131,7 +123,7 @@ class MD:
             yr = pd.read_sql_query(
                 "SELECT symbol,MAX(high) h,MIN(low) l FROM stock_prices "
                 "WHERE date>=date(?,'-365 days') AND symbol!='NEPSE' GROUP BY symbol",
-                c, params=(lat_d,))
+                c, params=(latest_price_date,))
             d52 = df.merge(yr, on="symbol", how="left")
             self.near_hi = d52[d52["close"] >= d52["h"] * 0.97].nlargest(self.top_n, "chg")
             self.near_lo = d52[d52["close"] <= d52["l"] * 1.03].nsmallest(self.top_n, "chg")
@@ -181,11 +173,14 @@ class MD:
                 base.update(live)
         return base
 
-    def detail(self, sym: str, limit: int = 60) -> Optional[Dict]:
+    def detail(self, sym: str, limit: int | None = 60) -> Optional[Dict]:
         c = _db()
-        h = pd.read_sql_query(
-            "SELECT date,open,high,low,close,volume FROM stock_prices "
-            "WHERE symbol=? ORDER BY date DESC LIMIT ?", c, params=(sym, limit))
+        query = "SELECT date,open,high,low,close,volume FROM stock_prices WHERE symbol=? ORDER BY date DESC"
+        params: tuple = (sym,)
+        if limit is not None:
+            query += " LIMIT ?"
+            params += (limit,)
+        h = pd.read_sql_query(query, c, params=params)
         ca = pd.read_sql_query(
             "SELECT bookclose_date,cash_dividend_pct,bonus_share_pct "
             "FROM corporate_actions WHERE symbol=? ORDER BY bookclose_date DESC LIMIT 5",
