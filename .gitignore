@@ -33,6 +33,7 @@ build/
 # === Virtual environments ===
 venv/
 .venv/
+.venv-linux/
 env/
 ENV/
 

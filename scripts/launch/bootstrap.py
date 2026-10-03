@@ -6,6 +6,7 @@ import hashlib
 import argparse
 import os
 import platform
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -40,6 +41,73 @@ def venv_python(root: Path) -> Path:
     return root / VENV_DIRNAME / "bin" / "python"
 
 
+def _python_is_supported(python: Path | str) -> bool:
+    try:
+        result = subprocess.run(
+            [str(python), "-c", "import sys; raise SystemExit(0 if (3, 10) <= sys.version_info[:2] < (3, 14) else 1)"],
+            capture_output=True,
+            check=False,
+        )
+    except OSError:
+        return False
+    return result.returncode == 0
+
+
+def select_linux_runtime(root: Path, python_candidates: Sequence[str] | None = None) -> tuple[Path, str]:
+    """Prefer a supported project environment, then the newest supported Python."""
+    project_python = venv_python(root)
+    if project_python.exists() and _python_is_supported(project_python):
+        return project_python, VENV_DIRNAME
+
+    names = python_candidates or ("python3.13", "python3.12", "python3.11", "python3.10", "python3")
+    for name in names:
+        candidate = shutil.which(name) if python_candidates is None else name
+        if candidate and _python_is_supported(candidate):
+            venv_dir = ".venv-linux" if project_python.exists() else VENV_DIRNAME
+            return Path(candidate), venv_dir
+    raise SystemExit("Python 3.10–3.13 is required. Install Python 3.12 and launch again.")
+
+
+def linux_applications_dir(env: dict[str, str] | None = None, home: Path | None = None) -> Path:
+    values = os.environ if env is None else env
+    data_home = values.get("XDG_DATA_HOME", "")
+    if data_home and Path(data_home).is_absolute():
+        return Path(data_home) / "applications"
+    return (home or Path.home()) / ".local" / "share" / "applications"
+
+
+def desktop_exec_quote(value: str) -> str:
+    """Quote one freedesktop Exec argument, including literal percent signs."""
+    escaped = value.replace("%", "%%").replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def install_linux_shortcut(root: Path, applications_dir: Path | None = None) -> Path:
+    """Install or replace the per-user application-menu shortcut."""
+    root = root.resolve()
+    launcher = root / "Launch Quant Terminal.sh"
+    if not launcher.is_file():
+        raise SystemExit(f"Linux launcher not found: {launcher}")
+    target_dir = applications_dir or linux_applications_dir()
+    target_dir.mkdir(parents=True, exist_ok=True)
+    desktop_file = target_dir / "nepse-quant-terminal.desktop"
+    contents = "\n".join((
+        "[Desktop Entry]",
+        "Version=1.0",
+        "Type=Application",
+        "Name=NEPSE Quant Terminal",
+        "Comment=NEPSE market research and paper trading",
+        f"Exec={desktop_exec_quote(str(launcher))}",
+        f"Path={root}",
+        "Icon=utilities-terminal",
+        "Terminal=true",
+        "Categories=Finance;Office;",
+        "",
+    ))
+    desktop_file.write_text(contents, encoding="utf-8")
+    return desktop_file
+
+
 def run(cmd: Sequence[str], *, cwd: Path, check: bool = True) -> subprocess.CompletedProcess:
     print(f"\n$ {' '.join(str(part) for part in cmd)}", flush=True)
     return subprocess.run([str(part) for part in cmd], cwd=str(cwd), check=check)
@@ -55,12 +123,15 @@ def ensure_supported_python() -> None:
     )
 
 
-def ensure_virtualenv(root: Path) -> Path:
-    python = venv_python(root)
+def ensure_virtualenv(root: Path, directory: str = VENV_DIRNAME) -> Path:
+    python = venv_python(root) if directory == VENV_DIRNAME else root / directory / "bin" / "python"
     if python.exists():
+        if not _python_is_supported(python):
+            raise SystemExit(f"Unsupported Python in {python}. Remove or rename that environment, then launch again.")
         return python
-    print(f"Creating local Python environment at {root / VENV_DIRNAME}...")
-    run([sys.executable, "-m", "venv", root / VENV_DIRNAME], cwd=root)
+    target = root / directory
+    print(f"Creating local Python environment at {target}...")
+    run([sys.executable, "-m", "venv", target], cwd=root)
     return python
 
 
@@ -151,11 +222,23 @@ def launch_dashboard(root: Path, python: Path, *, terminal: bool = False) -> int
 def main() -> int:
     parser = argparse.ArgumentParser(description="Launch NEPSE Quant")
     parser.add_argument("--tui", action="store_true", help="launch the optional terminal interface")
+    parser.add_argument("--install-desktop", action="store_true", help="install a Linux application-menu shortcut for this checkout")
+    parser.add_argument("--linux-launch-info", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--venv-directory", default=VENV_DIRNAME, help=argparse.SUPPRESS)
     args = parser.parse_args()
     root = repo_root()
+    if args.install_desktop:
+        if not sys.platform.startswith("linux"):
+            raise SystemExit("The application-menu shortcut is available on Linux only.")
+        print(install_linux_shortcut(root))
+        return 0
+    if args.linux_launch_info:
+        python, venv_dir = select_linux_runtime(root)
+        print(f"{python}\t{venv_dir}")
+        return 0
     os.chdir(root)
     ensure_supported_python()
-    python = ensure_virtualenv(root)
+    python = ensure_virtualenv(root, args.venv_directory)
     ensure_requirements(root, python)
     ensure_database(root, python)
     run_preflight(root, python)

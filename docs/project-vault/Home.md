@@ -12,6 +12,7 @@ This vault records the purpose and reasoning behind each project change. Git rec
 ## Change notes
 
 - [[2026-10-03-stock-detail-charts|Stock detail charts from Market]]
+- [[2026-10-03-linux-launch|Linux launcher and publishing workflow]]
 - [[2026-10-03-desktop-pagination|Clear desktop pagination labels]]
 - [[2026-10-03-desktop-live-logs|Collapsible desktop logs]]
 - [[2026-10-03-local-data-issues-and-daily-refresh|Shared price cache, scheduled daily refresh, stale-trade safeguards, and persistent fetch issues]]

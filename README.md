@@ -14,7 +14,7 @@ A compact cross-platform desktop research and paper-trading dashboard for the Ne
 - **Auto Trading Engine** — assigns a quantitative strategy to each account. The engine runs in the background, generates signals every 5 trading days, and manages entries/exits automatically (holding periods, stop losses, trailing stops, regime filters).
 - **Backtesting** — backtests on 6+ years of NEPSE price data, with a walk-forward replay harness and a statistical validation suite. The bundled C5 baseline shows a *historical, in-sample* +88% return (Sharpe ~2.2) vs. NEPSE +27% — a figure from a parameter sweep, **not corrected for multiple testing and not a forward-performance claim** (the repo ships no artifact reproducing it). Run the validation suite (deflated Sharpe, random-baseline percentile, CSCV/PBO) to see how it holds up; see [docs/VALIDATION_METHODOLOGY.md](docs/VALIDATION_METHODOLOGY.md).
 - **Model Research** — compare the existing signal ranking with an open-source scikit-learn ranker using rolling 504-day training and 63-day out-of-sample windows, NEPSE fees, and adjustable slippage. Research scores do not affect paper accounts.
-- **Market Dashboard** — live quotes, 52-week highs/lows, top movers, sector heatmap, volume signals.
+- **Market Dashboard** — live quotes, 52-week highs/lows, top movers, sector heatmap, volume signals, and clickable stock charts with cached financial reports.
 - **Portfolio Analytics** — unrealized/realized P&L, sector concentration, holding age buckets, max drawdown, alpha vs. NEPSE benchmark.
 - **Gold Hedge Overlay** — tracks gold/silver regime (risk-on / neutral / risk-off) and adjusts capital deployment accordingly.
 - **AI Agent** — on-demand analysis of your portfolio positions and signal shortlist. Defaults to a local Ollama model, with Gemma 4 MLX or Claude CLI available as optional backends.
@@ -237,6 +237,7 @@ Register it in the `SIGNAL_MAP` dict inside `run_backtest()` and add `"my_signal
 After downloading or cloning the repo, use the double-click launcher for your OS:
 
 - macOS: `Nepse Quant Terminal.app` or `Launch Quant Terminal.command`
+- Linux: `./Launch Quant Terminal.sh` (run `./Launch Quant Terminal.sh --install-desktop` to add this checkout to the application menu)
 - Windows: `Launch Quant Terminal.bat`
 
 The launcher creates `.venv`, installs dependencies, downloads the bundled market database if missing, runs preflight, and opens the desktop GUI. On Windows, the GUI runs without leaving a console window open. The optional TUI can be launched with `python scripts/launch/bootstrap.py --tui`.
@@ -251,7 +252,7 @@ See [`docs/EASY_LAUNCH.md`](docs/EASY_LAUNCH.md) for troubleshooting notes and m
 ### Installation
 
 ```bash
-git clone https://github.com/nlethetech/nepse-quant-terminal
+git clone https://github.com/Ayushrestha05/nepse-quant-terminal
 cd nepse-quant-terminal
 pip install -r requirements.txt
 ```
@@ -259,7 +260,7 @@ pip install -r requirements.txt
 Native Windows PowerShell:
 
 ```powershell
-git clone https://github.com/nlethetech/nepse-quant-terminal
+git clone https://github.com/Ayushrestha05/nepse-quant-terminal
 cd nepse-quant-terminal
 py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
