@@ -59,6 +59,43 @@ def test_number_input_accepts_finite_values_and_rejects_invalid_values():
             _number(value)
 
 
+def test_market_click_uses_clicked_row_symbol_and_ignores_headings():
+    class FakeMarketTable:
+        def identify_region(self, _x, y):
+            return "heading" if y == 0 else "cell"
+
+        def identify_row(self, _y):
+            return "row-on-visible-page"
+
+        def item(self, iid, _key):
+            assert iid == "row-on-visible-page"
+            return ("SYM100", "2026-10-02")
+
+    app = SimpleNamespace(_open_market_symbol=lambda symbol: opened.append(symbol))
+    opened = []
+    event = SimpleNamespace(widget=FakeMarketTable(), x=5, y=1)
+    DesktopDashboard._market_table_click(app, event)
+    assert opened == ["SYM100"]
+
+    event.y = 0
+    DesktopDashboard._market_table_click(app, event)
+    assert opened == ["SYM100"]
+
+
+def test_market_enter_opens_selected_row_symbol():
+    class FakeMarketTable:
+        def selection(self):
+            return ("visible-row",)
+
+        def item(self, _iid, _key):
+            return ("NABIL",)
+
+    opened = []
+    app = SimpleNamespace(tables={"Market": FakeMarketTable()}, _open_market_symbol=opened.append)
+    assert DesktopDashboard._market_table_activate(app) == "break"
+    assert opened == ["NABIL"]
+
+
 def test_market_table_pagination_labels_every_row_on_all_pages():
     app = _table_pager_app(290)
     label, previous, next_page = app.table_pagers["Market"]

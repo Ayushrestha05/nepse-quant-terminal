@@ -13,6 +13,7 @@ This folder is the project’s Obsidian vault. Start with [[Project Overview]], 
 
 - [[Project Overview]]
 - [[EASY_LAUNCH|Easy Launch]]
+- [[project-vault/Changes/2026-10-03-stock-detail-charts|Stock detail charts]]
 - [[architecture/PROJECT_STRUCTURE|Project structure]]
 
 ## Operations and validation

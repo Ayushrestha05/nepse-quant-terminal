@@ -109,6 +109,7 @@ class DesktopDashboard(tk.Tk):
         self.status_vars: dict[str, tk.StringVar] = {}
         self.detail_widgets: dict[str, tk.Text] = {}
         self.loaded: set[str] = set()
+        self.stock_detail_window = None
         self.current_page = "Market"
         self.current_account_id = "account_1"
         self.accounts: list[dict[str, Any]] = []
@@ -546,7 +547,62 @@ class DesktopDashboard(tk.Tk):
         ttk.Label(frame, textvariable=self.history_status, anchor="w").pack(fill="x")
         self.history_progress = ttk.Progressbar(frame, maximum=100, mode="determinate")
         self.history_progress.pack(fill="x", pady=(2, 7))
-        self._table(frame, "Market", (("symbol", "Symbol", 100), ("date", "Last Date", 95), ("close", "Close", 90), ("chg", "Change %", 90), ("volume", "Volume", 100), ("turn", "Turnover", 115)), height=20)
+        table = self._table(frame, "Market", (("symbol", "Symbol", 100), ("date", "Last Date", 95), ("close", "Close", 90), ("chg", "Change %", 90), ("volume", "Volume", 100), ("turn", "Turnover", 115)), height=20)
+        table.bind("<Button-1>", self._market_table_click, add="+")
+        table.bind("<Return>", self._market_table_activate, add="+")
+        table.bind("<KP_Enter>", self._market_table_activate, add="+")
+
+    @staticmethod
+    def _market_row_symbol(table, iid: str) -> str:
+        if not iid:
+            return ""
+        values = table.item(iid, "values")
+        return str(values[0]).strip().upper() if values else ""
+
+    def _market_table_click(self, event):
+        table = event.widget
+        if table.identify_region(event.x, event.y) != "cell":
+            return
+        symbol = DesktopDashboard._market_row_symbol(table, table.identify_row(event.y))
+        if symbol:
+            self._open_market_symbol(symbol)
+
+    def _market_table_activate(self, event=None):
+        table = self.tables.get("Market")
+        if table:
+            selection = table.selection()
+            symbol = DesktopDashboard._market_row_symbol(table, selection[0]) if selection else ""
+            if symbol:
+                self._open_market_symbol(symbol)
+                return "break"
+
+    def _open_market_symbol(self, symbol: str) -> None:
+        from apps.desktop.stock_detail import StockDetailWindow
+
+        window = self.stock_detail_window
+        if window is None or window.closed:
+            window = StockDetailWindow(
+                self,
+                self._load_stock_detail,
+                lambda: self._stock_detail_closed(window),
+            )
+            self.stock_detail_window = window
+        window.select(symbol)
+
+    def _stock_detail_closed(self, window) -> None:
+        if self.stock_detail_window is window:
+            self.stock_detail_window = None
+
+    def _load_stock_detail(self, symbol: str, done: Callable[[dict[str, Any]], None]) -> None:
+        from apps.desktop.stock_detail import detail_error_payload, load_stock_detail
+
+        def work():
+            try:
+                return load_stock_detail(symbol, self._db_path())
+            except Exception as exc:
+                return detail_error_payload(symbol, exc)
+
+        self._background("stock_detail", work, done)
 
     def _build_portfolio(self, frame):
         tabs = ttk.Notebook(frame)
@@ -1933,6 +1989,8 @@ class DesktopDashboard(tk.Tk):
                 logging.getLogger(__name__).exception("Could not stop paper engine")
         self.executor.shutdown(wait=False, cancel_futures=True)
         self.heavy_executor.shutdown(wait=False, cancel_futures=True)
+        if self.stock_detail_window and not self.stock_detail_window.closed:
+            self.stock_detail_window.close()
         self._remove_ui_log_handler()
         self.destroy()
 
@@ -1975,6 +2033,48 @@ def main() -> int:
         valid = valid and app.log_text.tag_cget("WARNING", "foreground") == "#a15c00"
         app._toggle_log_panel()
         valid = valid and not app.log_panel_open
+        import pandas as pd
+        from datetime import timedelta
+
+        history = pd.DataFrame({
+            "date": [(date.today() - timedelta(days=days)).isoformat() for days in range(74, -1, -1)],
+            "open": [100.0 + index for index in range(75)],
+            "high": [102.0 + index for index in range(75)],
+            "low": [99.0 + index for index in range(75)],
+            "close": [101.0 + index for index in range(75)],
+            "volume": [1000.0 + index for index in range(75)],
+        })
+        detail_payload = {
+            "symbol": "SMOKE",
+            "history": history,
+            "quote": {"security_name": "Smoke Company", "last_traded_price": 175.0, "fetched_at_utc": "2026-10-03T09:00:00+00:00"},
+            "report": {"company_name": "Smoke Company", "sector": "Hydropower", "summary": "Smoke report", "snapshot": [("EPS", "12.0")], "positives": [], "risks": [], "monitors": []},
+            "report_error": None,
+        }
+        app._load_stock_detail = lambda _symbol, done: done(detail_payload)
+        app._open_market_symbol("SMOKE")
+        first_window = app.stock_detail_window
+        app.update()
+        valid = valid and not first_window.closed and len(first_window.figure.axes) == 2
+        default_candles = len(first_window.figure.axes[0].patches)
+        first_window.line_chart.set(True)
+        first_window.render_chart()
+        app.update_idletasks()
+        valid = valid and first_window.figure.axes[0].lines[0].get_label() == "Close"
+        first_window.line_chart.set(False)
+        first_window.range_name.set("1M")
+        first_window.render_chart()
+        app.update_idletasks()
+        valid = valid and len(first_window.figure.axes[0].patches) < default_candles
+        first_window.window.geometry("920x680")
+        app.update_idletasks()
+        app._open_market_symbol("SMOKE2")
+        valid = valid and app.stock_detail_window is first_window
+        first_window.close()
+        valid = valid and app.stock_detail_window is None
+        app._open_market_symbol("SMOKE")
+        valid = valid and app.stock_detail_window is not first_window
+        app.stock_detail_window.close()
         app._remove_ui_log_handler()
         app.destroy()
         if not valid:
