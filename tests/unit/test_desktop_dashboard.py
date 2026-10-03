@@ -12,12 +12,113 @@ import pytest
 from apps.desktop.dashboard import DesktopDashboard, _UIQueueLogHandler, _number
 
 
+class _FakeTable:
+    def __init__(self):
+        self.rows = []
+
+    def get_children(self):
+        return tuple(range(len(self.rows)))
+
+    def delete(self, *_items):
+        self.rows.clear()
+
+    def insert(self, _parent, _index, *, values):
+        self.rows.append(values)
+
+
+class _FakePagerWidget:
+    def __init__(self, **options):
+        self.options = options
+
+    def configure(self, **options):
+        self.options.update(options)
+
+
+def _table_pager_app(row_count, page=0):
+    app = SimpleNamespace(
+        tables={"Market": _FakeTable()},
+        table_rows={"Market": [{"symbol": f"SYM{i:03d}"} for i in range(row_count)]},
+        table_pages={"Market": page},
+        table_columns={"Market": ("symbol",)},
+        table_pagers={"Market": (
+            _FakePagerWidget(text="No rows"),
+            _FakePagerWidget(state="disabled"),
+            _FakePagerWidget(state="disabled"),
+        )},
+        status_vars={},
+    )
+    app._show_table_page = MethodType(DesktopDashboard._show_table_page, app)
+    return app
+
+
 def test_number_input_accepts_finite_values_and_rejects_invalid_values():
     assert _number("1,234.5") == 1234.5
     assert _number("", fallback=2.0) == 2.0
     for value in ("abc", "nan", "inf"):
         with pytest.raises(ValueError):
             _number(value)
+
+
+def test_market_table_pagination_labels_every_row_on_all_pages():
+    app = _table_pager_app(290)
+    label, previous, next_page = app.table_pagers["Market"]
+    expected_pages = (
+        ("Rows 1 to 100 of 290", "SYM000", 100, "disabled", "normal"),
+        ("Rows 101 to 200 of 290", "SYM100", 100, "normal", "normal"),
+        ("Rows 201 to 290 of 290", "SYM200", 90, "normal", "disabled"),
+    )
+
+    for index, (text, first_symbol, visible_count, previous_state, next_state) in enumerate(expected_pages):
+        DesktopDashboard._show_table_page(app, "Market")
+        assert label.options["text"] == text
+        assert app.tables["Market"].rows[0][0] == first_symbol
+        assert len(app.tables["Market"].rows) == visible_count
+        assert previous.options["state"] == previous_state
+        assert next_page.options["state"] == next_state
+        if index < len(expected_pages) - 1:
+            DesktopDashboard._change_table_page(app, "Market", 1)
+
+
+@pytest.mark.parametrize(
+    ("row_count", "expected_label", "visible_count"),
+    [(0, "No rows", 0), (100, "Rows 1 to 100 of 100", 100)],
+)
+def test_table_pager_handles_empty_and_exactly_one_page(row_count, expected_label, visible_count):
+    app = _table_pager_app(row_count)
+    DesktopDashboard._show_table_page(app, "Market")
+
+    label, previous, next_page = app.table_pagers["Market"]
+    assert label.options["text"] == expected_label
+    assert len(app.tables["Market"].rows) == visible_count
+    assert previous.options["state"] == "disabled"
+    assert next_page.options["state"] == "disabled"
+
+
+@pytest.mark.parametrize(("page", "bounded_page"), [(-4, 0), (99, 2)])
+def test_table_pager_clamps_invalid_page_numbers(page, bounded_page):
+    app = _table_pager_app(290, page=page)
+    DesktopDashboard._show_table_page(app, "Market")
+
+    assert app.table_pages["Market"] == bounded_page
+    assert app.table_pagers["Market"][0].options["text"] == (
+        "Rows 1 to 100 of 290" if bounded_page == 0 else "Rows 201 to 290 of 290"
+    )
+
+
+def test_table_pager_clamps_after_rows_shrink_and_refresh_resets_page():
+    app = _table_pager_app(290, page=2)
+    app.table_rows["Market"] = app.table_rows["Market"][:150]
+    DesktopDashboard._show_table_page(app, "Market")
+    label = app.table_pagers["Market"][0]
+
+    assert app.table_pages["Market"] == 1
+    assert label.options["text"] == "Rows 101 to 150 of 150"
+    assert len(app.tables["Market"].rows) == 50
+
+    DesktopDashboard._populate(app, "Market", app.table_rows["Market"][:75])
+    assert app.table_pages["Market"] == 0
+    assert label.options["text"] == "Rows 1 to 75 of 75"
+    assert len(app.tables["Market"].rows) == 75
 
 
 def test_log_entries_are_retained_while_collapsed_and_bounded():

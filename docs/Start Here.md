@@ -27,5 +27,6 @@ This folder is the project’s Obsidian vault. Start with [[Project Overview]], 
 - [[project-vault/Home|Change log home]]
 - [[project-vault/Templates/Feature Change|Feature note template]]
 - [[project-vault/Changes/2026-10-03-desktop-live-logs|Collapsible desktop logs]]
+- [[project-vault/Changes/2026-10-03-desktop-pagination|Clear desktop pagination labels]]
 
 New implementation notes live under `project-vault/Changes/` and are committed with their code changes.

@@ -38,6 +38,7 @@ PAGES = (
     "Model Research",
     "Issues",
 )
+_TABLE_PAGE_SIZE = 100
 
 
 def _number(value: Any, fallback: float | None = None) -> float:
@@ -444,9 +445,13 @@ class DesktopDashboard(tk.Tk):
         xbar = ttk.Scrollbar(wrap, orient="horizontal", command=table.xview)
         table.configure(yscrollcommand=ybar.set, xscrollcommand=xbar.set)
         pager = ttk.Frame(wrap)
-        page_label = ttk.Label(pager, text="0 rows", anchor="center")
-        previous = ttk.Button(pager, text="Previous", command=lambda: self._change_table_page(name, -1))
-        next_page = ttk.Button(pager, text="Next", command=lambda: self._change_table_page(name, 1))
+        page_label = ttk.Label(pager, text="No rows", anchor="center")
+        previous = ttk.Button(
+            pager, text="Previous", state="disabled", command=lambda: self._change_table_page(name, -1)
+        )
+        next_page = ttk.Button(
+            pager, text="Next", state="disabled", command=lambda: self._change_table_page(name, 1)
+        )
         previous.pack(side="left")
         page_label.pack(side="left", fill="x", expand=True, padx=8)
         next_page.pack(side="right")
@@ -460,11 +465,12 @@ class DesktopDashboard(tk.Tk):
         self.table_rows[name] = []
         self.table_pages[name] = 0
         self.table_pagers[name] = (page_label, previous, next_page)
+        self._show_table_page(name)
         return table
 
     def _change_table_page(self, name: str, offset: int) -> None:
         rows = self.table_rows.get(name, [])
-        pages = max(1, (len(rows) + 99) // 100)
+        pages = max(1, (len(rows) + _TABLE_PAGE_SIZE - 1) // _TABLE_PAGE_SIZE)
         self.table_pages[name] = min(max(self.table_pages.get(name, 0) + offset, 0), pages - 1)
         self._show_table_page(name)
 
@@ -473,15 +479,19 @@ class DesktopDashboard(tk.Tk):
         if not table:
             return
         rows = self.table_rows.get(name, [])
-        page = self.table_pages.get(name, 0)
-        start, end = page * 100, min((page + 1) * 100, len(rows))
-        table.delete(*table.get_children())
+        pages = max(1, (len(rows) + _TABLE_PAGE_SIZE - 1) // _TABLE_PAGE_SIZE)
+        page = min(max(self.table_pages.get(name, 0), 0), pages - 1)
+        self.table_pages[name] = page
+        start, end = page * _TABLE_PAGE_SIZE, min((page + 1) * _TABLE_PAGE_SIZE, len(rows))
+        children = table.get_children()
+        if children:
+            table.delete(*children)
         keys = self.table_columns[name]
         for row in rows[start:end]:
             values = [row.get(key, "") for key in keys]
             table.insert("", "end", values=tuple("" if value is None else value for value in values))
         label, previous, next_page = self.table_pagers[name]
-        label.configure(text=f"{start + 1:,}–{end:,} of {len(rows):,}" if rows else "No rows")
+        label.configure(text=f"Rows {start + 1:,} to {end:,} of {len(rows):,}" if rows else "No rows")
         previous.configure(state="normal" if page > 0 else "disabled")
         next_page.configure(state="normal" if end < len(rows) else "disabled")
 
@@ -1936,17 +1946,31 @@ def main() -> int:
     app = DesktopDashboard(smoke=args.smoke)
     if args.smoke:
         valid = len(app.page_list.get_children("")) == len(PAGES) and len(app.pages) == len(PAGES) and len(app.tables) == 14
+        valid = valid and all(
+            label.cget("text") == "No rows"
+            and previous.instate(("disabled",))
+            and next_page.instate(("disabled",))
+            for label, previous, next_page in app.table_pagers.values()
+        )
         app._populate("Signals", [{"symbol": f"SYM{i:03d}"} for i in range(205)])
         valid = valid and len(app.tables["Signals"].get_children()) == 100
-        valid = valid and app.table_pagers["Signals"][0].cget("text") == "1–100 of 205"
+        page_label, previous, next_page = app.table_pagers["Signals"]
+        valid = valid and page_label.cget("text") == "Rows 1 to 100 of 205"
+        valid = valid and previous.instate(("disabled",)) and not next_page.instate(("disabled",))
         app._change_table_page("Signals", 1)
         valid = valid and len(app.tables["Signals"].get_children()) == 100
         valid = valid and app.tables["Signals"].item(app.tables["Signals"].get_children()[0], "values")[0] == "SYM100"
+        valid = valid and page_label.cget("text") == "Rows 101 to 200 of 205"
+        valid = valid and not previous.instate(("disabled",)) and not next_page.instate(("disabled",))
         app._change_table_page("Signals", 1)
         valid = valid and len(app.tables["Signals"].get_children()) == 5
+        valid = valid and page_label.cget("text") == "Rows 201 to 205 of 205"
+        valid = valid and not previous.instate(("disabled",)) and next_page.instate(("disabled",))
+        app._change_table_page("Signals", -1)
+        valid = valid and page_label.cget("text") == "Rows 101 to 200 of 205"
+        app._toggle_log_panel()
         app._append_log_entry(logging.WARNING, "History", "Warning sample")
         valid = valid and "WARNING" in app.log_text.get("1.0", "end") and "[History]" in app.log_text.get("1.0", "end")
-        app._toggle_log_panel()
         valid = valid and app.log_panel_open and app.log_panel.winfo_manager() == "pack"
         valid = valid and app.log_text.tag_cget("WARNING", "foreground") == "#a15c00"
         app._toggle_log_panel()
