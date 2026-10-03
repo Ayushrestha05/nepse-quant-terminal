@@ -237,7 +237,7 @@ Register it in the `SIGNAL_MAP` dict inside `run_backtest()` and add `"my_signal
 After downloading or cloning the repo, use the double-click launcher for your OS:
 
 - macOS: `Nepse Quant Terminal.app` or `Launch Quant Terminal.command`
-- Linux: `./Launch Quant Terminal.sh` (run `./Launch Quant Terminal.sh --install-desktop` to add this checkout to the application menu)
+- Linux: `"./Launch Quant Terminal.sh"` (run `"./Launch Quant Terminal.sh" --install-desktop` to add this checkout to the application menu)
 - Windows: `Launch Quant Terminal.bat`
 
 The launcher creates `.venv`, installs dependencies, downloads the bundled market database if missing, runs preflight, and opens the desktop GUI. On Windows, the GUI runs without leaving a console window open. The optional TUI can be launched with `python scripts/launch/bootstrap.py --tui`.

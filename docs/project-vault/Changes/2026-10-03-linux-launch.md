@@ -12,7 +12,7 @@ tags:
 ## What changed
 
 - Added a Linux launcher that chooses supported Python, reuses the app bootstrap, and installs an idempotent per-user application-menu entry.
-- Documented Linux launch setup and recorded the authorized push policy in the repository workflow.
+- Documented Linux launch setup with shell-quoted commands for its spaced filename, and recorded the authorized push policy in the repository workflow.
 - Set the Git origin to the user's repository. Kept the configured database release as a separate data source.
 
 ## Why
