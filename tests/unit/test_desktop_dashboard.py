@@ -1,10 +1,15 @@
+import logging
+import queue
 import sqlite3
+import threading
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import pytest
 
-from apps.desktop.dashboard import DesktopDashboard, _number
+from apps.desktop.dashboard import DesktopDashboard, _UIQueueLogHandler, _number
 
 
 def test_number_input_accepts_finite_values_and_rejects_invalid_values():
@@ -13,6 +18,187 @@ def test_number_input_accepts_finite_values_and_rejects_invalid_values():
     for value in ("abc", "nan", "inf"):
         with pytest.raises(ValueError):
             _number(value)
+
+
+def test_log_entries_are_retained_while_collapsed_and_bounded():
+    counts = []
+    app = SimpleNamespace(
+        log_entries=deque(maxlen=1000),
+        log_panel_open=False,
+        log_count=SimpleNamespace(set=counts.append),
+    )
+
+    for index in range(1001):
+        DesktopDashboard._append_log_entry(app, logging.INFO, "Task", f"event {index}")
+
+    assert len(app.log_entries) == 1000
+    assert app.log_entries[0][3] == "event 1"
+    assert app.log_entries[-1][3] == "event 1000"
+    assert counts[-1] == "1,000 entries"
+    assert app.log_entries[0][2] == "Task"
+
+
+def test_log_panel_toggle_expands_and_collapses():
+    class FakeWidget:
+        def __init__(self):
+            self.manager = ""
+            self.text = ""
+
+        def pack(self, **_kwargs):
+            self.manager = "pack"
+
+        def pack_forget(self):
+            self.manager = ""
+
+        def configure(self, *, text):
+            self.text = text
+
+    panel = FakeWidget()
+    button = FakeWidget()
+    renders = []
+    app = SimpleNamespace(log_panel_open=False, log_panel=panel, logs_button=button)
+    app._render_log_entries = MethodType(lambda self: renders.append(True), app)
+
+    DesktopDashboard._toggle_log_panel(app)
+    assert app.log_panel_open and panel.manager == "pack" and button.text == "Hide logs"
+    DesktopDashboard._toggle_log_panel(app)
+    assert not app.log_panel_open and panel.manager == "" and button.text == "Logs"
+    assert renders == [True]
+
+
+def test_log_severity_maps_to_stable_color_tags():
+    assert DesktopDashboard._log_tag(logging.INFO) == "INFO"
+    assert DesktopDashboard._log_tag(logging.WARNING) == "WARNING"
+    assert DesktopDashboard._log_tag(logging.ERROR) == "ERROR"
+    assert DesktopDashboard._log_tag(logging.CRITICAL) == "ERROR"
+
+
+def test_visible_log_entry_includes_category_and_severity_tag():
+    class FakeText:
+        def __init__(self):
+            self.inserted = []
+
+        def configure(self, **_kwargs):
+            pass
+
+        def insert(self, _index, text, tag):
+            self.inserted.append((text, tag))
+
+        def see(self, _index):
+            pass
+
+    app = SimpleNamespace(
+        log_entries=deque(maxlen=1000),
+        log_panel_open=True,
+        log_count=SimpleNamespace(set=lambda _value: None),
+        log_text=FakeText(),
+    )
+    app._log_tag = DesktopDashboard._log_tag
+
+    DesktopDashboard._append_log_entry(app, logging.ERROR, "History", "provider failed")
+
+    text, tag = app.log_text.inserted[0]
+    assert "[History] provider failed" in text
+    assert tag == "ERROR"
+
+
+def test_runtime_log_handler_can_queue_records_from_worker_threads():
+    events = queue.SimpleQueue()
+    handler = _UIQueueLogHandler(events)
+    record = logging.LogRecord("backend.market", logging.WARNING, "market.py", 12, "provider timeout", (), None)
+    worker = threading.Thread(target=handler.handle, args=(record,))
+    worker.start()
+    worker.join()
+
+    assert events.get_nowait() == ("log", logging.WARNING, "backend.market", "provider timeout")
+
+
+def test_ui_log_handler_restores_the_root_logger_level():
+    root = logging.getLogger()
+    original_level = root.level
+    app = SimpleNamespace(
+        _log_root=root,
+        _previous_root_log_level=None,
+        _ui_log_handler=None,
+        ui_events=queue.SimpleQueue(),
+    )
+    try:
+        root.setLevel(logging.WARNING)
+        DesktopDashboard._install_ui_log_handler(app)
+        assert root.level == logging.INFO
+        DesktopDashboard._remove_ui_log_handler(app)
+        assert root.level == logging.WARNING
+    finally:
+        if app._ui_log_handler:
+            DesktopDashboard._remove_ui_log_handler(app)
+        root.setLevel(original_level)
+
+
+def test_background_task_queues_start_and_completion_entries():
+    events = queue.SimpleQueue()
+    app = SimpleNamespace(ui_events=events, jobs={}, executor=ThreadPoolExecutor(max_workers=1))
+    app.heavy_executor = app.executor
+    app._queue_log = MethodType(lambda self, level, category, message: events.put(("log", level, category, message)), app)
+    completed = []
+    key = "refresh:Market"
+    try:
+        DesktopDashboard._background(app, key, lambda: "loaded", completed.append)
+        app.jobs[key].result(timeout=2)
+        background_event = None
+        queued_logs = []
+        while True:
+            try:
+                event = events.get_nowait()
+            except queue.Empty:
+                break
+            if event[0] == "log":
+                queued_logs.append(event[3])
+            elif event[0] == "background":
+                background_event = event
+
+        assert any(message == f"Started {key}" for message in queued_logs)
+        assert background_event is not None
+        DesktopDashboard._finish_background(app, *background_event[1:])
+        assert completed == ["loaded"]
+        assert events.get_nowait() == ("log", logging.INFO, "Task", f"Completed {key}")
+    finally:
+        app.executor.shutdown(wait=True)
+
+
+def test_history_subprocess_output_is_queued_with_category_and_severity(monkeypatch, tmp_path):
+    lines = ["Connecting to history provider", "[1/2] AAA status=SUCCESS", "WARNING: partial response"]
+
+    class FakeProcess:
+        def __init__(self):
+            self.stdout = iter(lines)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def wait(self):
+            return 0
+
+    monkeypatch.setattr("apps.desktop.dashboard.subprocess.Popen", lambda *_args, **_kwargs: FakeProcess())
+    events = queue.SimpleQueue()
+    app = SimpleNamespace(ui_events=events)
+    cancel_file = tmp_path / "ingestion.cancel"
+
+    result = DesktopDashboard._run_history_update(app, cancel_file, symbols=["AAA"])
+
+    queued = []
+    while True:
+        try:
+            queued.append(events.get_nowait())
+        except queue.Empty:
+            break
+    history_logs = [event for event in queued if event[0] == "log"]
+    assert result["output"] == lines
+    assert [event[3] for event in history_logs] == lines
+    assert all(event[2] == "History" for event in history_logs)
+    assert history_logs[-1][1] == logging.WARNING
 
 
 def test_market_coverage_reports_missing_months_and_benchmark_date(tmp_path: Path):

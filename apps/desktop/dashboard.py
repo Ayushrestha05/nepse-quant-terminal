@@ -15,7 +15,9 @@ import tempfile
 import threading
 import time
 import tkinter as tk
+import traceback
 import uuid
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -64,6 +66,21 @@ def _rows(frame, limit: int = 0) -> list[dict[str, Any]]:
     return view.astype(object).where(view.notna(), None).to_dict(orient="records")
 
 
+class _UIQueueLogHandler(logging.Handler):
+    """Forward Python log records to the Tk thread through the UI event queue."""
+
+    def __init__(self, events: queue.SimpleQueue):
+        super().__init__(logging.INFO)
+        self.events = events
+        self.setFormatter(logging.Formatter("%(message)s"))
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            self.events.put(("log", record.levelno, record.name or "Python", self.format(record)))
+        except Exception:
+            self.handleError(record)
+
+
 class DesktopDashboard(tk.Tk):
     """Tk interface; expensive data loads and all simulations run in workers."""
 
@@ -76,6 +93,11 @@ class DesktopDashboard(tk.Tk):
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="nepse-ui")
         self.heavy_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="nepse-heavy")
         self.ui_events: queue.SimpleQueue = queue.SimpleQueue()
+        self.log_entries: deque[tuple[str, int, str, str]] = deque(maxlen=1000)
+        self.log_panel_open = False
+        self._log_root = logging.getLogger()
+        self._previous_root_log_level: int | None = None
+        self._ui_log_handler: _UIQueueLogHandler | None = None
         self.jobs: dict[str, Any] = {}
         self.pages: dict[str, tk.Frame] = {}
         self.tables: dict[str, ttk.Treeview] = {}
@@ -103,6 +125,7 @@ class DesktopDashboard(tk.Tk):
         self.account_var = tk.StringVar(value="Loading accounts…")
         self.app_status = tk.StringVar(value="Ready")
         self._build_shell()
+        self.app_status.trace_add("write", self._app_status_changed)
         if not smoke:
             self._init_runtime()
             self.after(50, self._poll_ui_events)
@@ -112,6 +135,8 @@ class DesktopDashboard(tk.Tk):
         else:
             for name in PAGES:
                 self.pages[name] = self._build_page(name)
+        self._install_ui_log_handler()
+        self.report_callback_exception = self._report_callback_exception
         self.protocol("WM_DELETE_WINDOW", self._close)
 
     def _build_shell(self) -> None:
@@ -149,8 +174,108 @@ class DesktopDashboard(tk.Tk):
         self.page_list.selection_set(PAGES[0])
         self.page_list.bind("<<TreeviewSelect>>", self._page_selected)
         self.content = content
+        self.log_area = ttk.Frame(self)
+        self.log_area.pack(fill="x", padx=12, pady=(0, 4))
+        log_controls = ttk.Frame(self.log_area)
+        log_controls.pack(fill="x")
+        self.log_count = tk.StringVar(value="0 entries")
+        ttk.Label(log_controls, textvariable=self.log_count, anchor="e").pack(side="right", padx=(8, 0))
+        self.logs_button = ttk.Button(log_controls, text="Logs", command=self._toggle_log_panel)
+        self.logs_button.pack(side="right")
+        self.log_panel = ttk.Frame(self.log_area)
+        log_text_frame = ttk.Frame(self.log_panel)
+        log_text_frame.pack(fill="both", expand=True)
+        self.log_text = tk.Text(log_text_frame, height=8, wrap="none", state="disabled")
+        log_ybar = ttk.Scrollbar(log_text_frame, orient="vertical", command=self.log_text.yview)
+        log_xbar = ttk.Scrollbar(log_text_frame, orient="horizontal", command=self.log_text.xview)
+        self.log_text.configure(yscrollcommand=log_ybar.set, xscrollcommand=log_xbar.set)
+        self.log_text.grid(row=0, column=0, sticky="nsew")
+        log_ybar.grid(row=0, column=1, sticky="ns")
+        log_xbar.grid(row=1, column=0, sticky="ew")
+        log_text_frame.rowconfigure(0, weight=1)
+        log_text_frame.columnconfigure(0, weight=1)
+        self.log_text.tag_configure("INFO", foreground=self.theme_fg)
+        self.log_text.tag_configure("WARNING", foreground="#a15c00")
+        self.log_text.tag_configure("ERROR", foreground="#b42318")
+        self.log_text.tag_configure("DEBUG", foreground="#667085")
         ttk.Separator(self, orient="horizontal").pack(fill="x")
         ttk.Label(self, textvariable=self.app_status, anchor="w", padding=(10, 4)).pack(fill="x")
+
+    def _install_ui_log_handler(self) -> None:
+        self._previous_root_log_level = self._log_root.level
+        self._ui_log_handler = _UIQueueLogHandler(self.ui_events)
+        self._log_root.addHandler(self._ui_log_handler)
+        if self._log_root.level > logging.INFO:
+            self._log_root.setLevel(logging.INFO)
+
+    def _remove_ui_log_handler(self) -> None:
+        if self._ui_log_handler:
+            self._log_root.removeHandler(self._ui_log_handler)
+            self._ui_log_handler.close()
+            self._ui_log_handler = None
+            if self._previous_root_log_level is not None:
+                self._log_root.setLevel(self._previous_root_log_level)
+
+    def _queue_log(self, level: int, category: str, message: str) -> None:
+        self.ui_events.put(("log", level, category, str(message)))
+
+    def _app_status_changed(self, *_args) -> None:
+        message = self.app_status.get().strip()
+        if message:
+            lowered = message.lower()
+            level = logging.ERROR if any(word in lowered for word in ("failed", "error", "could not")) else logging.INFO
+            self._queue_log(level, "Task", message)
+
+    def _report_callback_exception(self, exc_type, exc_value, exc_traceback) -> None:
+        detail = "".join(traceback.format_exception(exc_type, exc_value, exc_traceback)).rstrip()
+        self._queue_log(logging.ERROR, "Task", detail)
+
+    def _toggle_log_panel(self) -> None:
+        self.log_panel_open = not self.log_panel_open
+        if self.log_panel_open:
+            self.log_panel.pack(fill="both", expand=False, pady=(4, 0))
+            self._render_log_entries()
+            self.logs_button.configure(text="Hide logs")
+        else:
+            self.log_panel.pack_forget()
+            self.logs_button.configure(text="Logs")
+
+    @staticmethod
+    def _log_tag(level: int) -> str:
+        if level >= logging.ERROR:
+            return "ERROR"
+        if level >= logging.WARNING:
+            return "WARNING"
+        if level < logging.INFO:
+            return "DEBUG"
+        return "INFO"
+
+    def _append_log_entry(self, level: int, category: str, message: str) -> None:
+        timestamp = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
+        clean_message = " ↵ ".join(str(message).splitlines())
+        entry = (timestamp, level, str(category), clean_message)
+        dropped_oldest = len(self.log_entries) == self.log_entries.maxlen
+        self.log_entries.append(entry)
+        self.log_count.set(f"{len(self.log_entries):,} entries")
+        if not self.log_panel_open:
+            return
+        self.log_text.configure(state="normal")
+        if dropped_oldest:
+            self.log_text.delete("1.0", "2.0")
+        tag = self._log_tag(level)
+        line = f"{timestamp}  {logging.getLevelName(level):<8} [{category}] {clean_message}\n"
+        self.log_text.insert("end", line, tag)
+        self.log_text.see("end")
+        self.log_text.configure(state="disabled")
+
+    def _render_log_entries(self) -> None:
+        self.log_text.configure(state="normal")
+        self.log_text.delete("1.0", "end")
+        for timestamp, level, category, message in self.log_entries:
+            line = f"{timestamp}  {logging.getLevelName(level):<8} [{category}] {message}\n"
+            self.log_text.insert("end", line, self._log_tag(level))
+        self.log_text.see("end")
+        self.log_text.configure(state="disabled")
 
     def _init_runtime(self) -> None:
         from apps.tui.io.persistence import (
@@ -259,7 +384,9 @@ class DesktopDashboard(tk.Tk):
                 event = self.ui_events.get_nowait()
             except queue.Empty:
                 break
-            if event[0] == "status":
+            if event[0] == "log":
+                self._append_log_entry(event[1], event[2], event[3])
+            elif event[0] == "status":
                 self.app_status.set(event[1])
             elif event[0] == "refresh":
                 self._load_page(event[1], force=True)
@@ -649,6 +776,7 @@ class DesktopDashboard(tk.Tk):
 
     def _background(self, key: str, work: Callable[[], Any], done: Callable[[Any], None], *, heavy: bool = False) -> None:
         executor = self.heavy_executor if heavy else self.executor
+        self._queue_log(logging.INFO, "Task", f"Started {key}")
         future = executor.submit(work)
         self.jobs[key] = future
 
@@ -665,6 +793,7 @@ class DesktopDashboard(tk.Tk):
     def _finish_background(self, key, done, payload, error):
         self.jobs.pop(key, None)
         if error:
+            self._queue_log(logging.ERROR, "Task", f"{key} failed: {error}")
             target = key.split(":", 1)[-1]
             if target == "lookup":
                 target = "Lookup"
@@ -694,6 +823,7 @@ class DesktopDashboard(tk.Tk):
             return
         if done:
             done(payload)
+        self._queue_log(logging.INFO, "Task", f"Completed {key}")
 
     def _auto_refresh(self):
         if not self.smoke and not self.research_cancel and not self.history_update_running and self.current_page not in {"Signals", "Agents", "Rates & Commodities", "Strategies", "Model Research"}:
@@ -1012,6 +1142,13 @@ class DesktopDashboard(tk.Tk):
                 lines.append(line)
                 if len(lines) > 30:
                     del lines[0]
+                lowered = line.lower()
+                level = (
+                    logging.ERROR if any(word in lowered for word in ("error", "failed", "traceback"))
+                    else logging.WARNING if "warning" in lowered
+                    else logging.INFO
+                )
+                self.ui_events.put(("log", level, "History", line))
                 started = re.search(r"started run_id=(\d+)", line)
                 if started:
                     run_id = int(started.group(1))
@@ -1129,6 +1266,7 @@ class DesktopDashboard(tk.Tk):
             self.history_cancel_file.write_text("cancel", encoding="utf-8")
             self.history_cancel_button.configure(state="disabled")
             self.history_status.set("Cancellation requested · the current symbol will finish first.")
+            self._queue_log(logging.WARNING, "History", "Cancellation requested; the current symbol will finish first.")
 
     def _show_history_errors(self) -> None:
         if "Issues" in self.page_list.get_children(""):
@@ -1460,10 +1598,14 @@ class DesktopDashboard(tk.Tk):
     def _watch_add(self):
         symbol = self.watch_symbol.get().strip().upper()
         if symbol:
+            self._queue_log(logging.INFO, "Task", f"Adding {symbol} to the watchlist")
             values = self._watchlist_values()
             if not any(row["symbol"] == symbol for row in values):
                 values.append({"kind": "stock", "key": f"stock:{symbol}", "label": symbol, "symbol": symbol})
                 self._save_watchlist(values)
+                self._queue_log(logging.INFO, "Task", f"Added {symbol} to the watchlist")
+            else:
+                self._queue_log(logging.INFO, "Task", f"{symbol} is already on the watchlist")
             self.watch_symbol.set("")
             self.loaded.discard("Watchlist")
             self._load_page("Watchlist", force=True)
@@ -1473,7 +1615,9 @@ class DesktopDashboard(tk.Tk):
         selected = table.selection()
         if selected:
             symbol = table.item(selected[0], "values")[0]
+            self._queue_log(logging.INFO, "Task", f"Removing {symbol} from the watchlist")
             self._save_watchlist([row for row in self._watchlist_values() if row["symbol"] != symbol])
+            self._queue_log(logging.INFO, "Task", f"Removed {symbol} from the watchlist")
             self.loaded.discard("Watchlist")
             self._load_page("Watchlist", force=True)
 
@@ -1485,6 +1629,7 @@ class DesktopDashboard(tk.Tk):
         name = simpledialog.askstring("New paper account", "Account name", parent=self)
         if not name or not name.strip():
             return
+        self._queue_log(logging.INFO, "Task", f"Creating paper account {name.strip()}")
         registry = _load_accounts_registry()
         account_id = f"account_{max([int(str(row.get('id', 'account_0')).split('_')[-1]) for row in registry.get('accounts', []) if str(row.get('id', '')).split('_')[-1].isdigit()] + [0]) + 1}"
         account_dir = _account_dir(account_id)
@@ -1501,8 +1646,10 @@ class DesktopDashboard(tk.Tk):
         self._account_changed()
         self.loaded.discard("Account")
         self._load_page("Account", force=True)
+        self._queue_log(logging.INFO, "Task", f"Created paper account {account_id}")
 
     def _set_nav(self):
+        self._queue_log(logging.INFO, "Task", "Updating paper account NAV")
         try:
             target = _number(self.nav_var.get())
             if target <= 0:
@@ -1525,7 +1672,9 @@ class DesktopDashboard(tk.Tk):
             self.loaded.discard("Account")
             self.loaded.discard("Portfolio")
             self._load_page(self.current_page, force=True)
+            self._queue_log(logging.INFO, "Task", "Paper account NAV updated")
         except Exception as exc:
+            self._queue_log(logging.ERROR, "Task", f"Paper account NAV update failed: {exc}")
             messagebox.showerror("Unable to set NAV", str(exc), parent=self)
 
     def _import_portfolio(self):
@@ -1574,6 +1723,7 @@ class DesktopDashboard(tk.Tk):
         self.strategy_editor.insert("1.0", json.dumps(payload, indent=2, default=str))
 
     def _save_strategy(self):
+        self._queue_log(logging.INFO, "Task", "Saving custom strategy")
         try:
             from backend.trading import strategy_registry
 
@@ -1583,6 +1733,7 @@ class DesktopDashboard(tk.Tk):
             self._load_page("Strategies", force=True)
             self.app_status.set(f"Saved custom strategy {saved['name']} ({saved['id']})")
         except Exception as exc:
+            self._queue_log(logging.ERROR, "Task", f"Saving custom strategy failed: {exc}")
             messagebox.showerror("Invalid strategy", str(exc), parent=self)
 
     def _assign_strategy(self):
@@ -1591,6 +1742,7 @@ class DesktopDashboard(tk.Tk):
             messagebox.showinfo("Strategies", "Select a strategy first.", parent=self)
             return
         strategy_id = str(self.tables["Strategies"].item(selected[0], "values")[0])
+        self._queue_log(logging.INFO, "Task", f"Assigning strategy {strategy_id} to {self.current_account_id}")
         from apps.tui.io.persistence import _load_accounts_registry, _save_accounts_registry
         from configs.long_term import LONG_TERM_CONFIG
 
@@ -1687,7 +1839,9 @@ class DesktopDashboard(tk.Tk):
     def _research_progress(self, payload):
         if "progress_pct" in payload:
             self.research_progress.configure(value=payload["progress_pct"])
-        self._set_research_status(payload.get("message") or payload.get("phase") or payload.get("stage") or "Running…")
+        message = payload.get("message") or payload.get("phase") or payload.get("stage") or "Running…"
+        self._queue_log(logging.INFO, "Research", str(message))
+        self._set_research_status(message)
 
     def _research_complete(self, payload):
         self.research_cancel = None
@@ -1769,6 +1923,7 @@ class DesktopDashboard(tk.Tk):
                 logging.getLogger(__name__).exception("Could not stop paper engine")
         self.executor.shutdown(wait=False, cancel_futures=True)
         self.heavy_executor.shutdown(wait=False, cancel_futures=True)
+        self._remove_ui_log_handler()
         self.destroy()
 
 
@@ -1789,6 +1944,14 @@ def main() -> int:
         valid = valid and app.tables["Signals"].item(app.tables["Signals"].get_children()[0], "values")[0] == "SYM100"
         app._change_table_page("Signals", 1)
         valid = valid and len(app.tables["Signals"].get_children()) == 5
+        app._append_log_entry(logging.WARNING, "History", "Warning sample")
+        valid = valid and "WARNING" in app.log_text.get("1.0", "end") and "[History]" in app.log_text.get("1.0", "end")
+        app._toggle_log_panel()
+        valid = valid and app.log_panel_open and app.log_panel.winfo_manager() == "pack"
+        valid = valid and app.log_text.tag_cget("WARNING", "foreground") == "#a15c00"
+        app._toggle_log_panel()
+        valid = valid and not app.log_panel_open
+        app._remove_ui_log_handler()
         app.destroy()
         if not valid:
             return 1
