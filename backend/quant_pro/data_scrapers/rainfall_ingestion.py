@@ -176,13 +176,15 @@ def run_ingestion(
     start_date: str = "2020-01-01",
     end_date: str | None = None,
     db_path: str | None = None,
+    force: bool = False,
 ) -> dict:
-    """Run full rainfall ingestion pipeline.
+    """Run rainfall ingestion pipeline (incremental by default).
 
     Args:
-        start_date: Start date in YYYY-MM-DD format.
+        start_date: Fallback start when DB empty (YYYY-MM-DD).
         end_date: End date in YYYY-MM-DD format (defaults to yesterday).
         db_path: Path to SQLite database.
+        force: If True, ignore stored dates and re-fetch from start_date.
 
     Returns:
         Summary dict with counts per basin.
@@ -194,18 +196,34 @@ def run_ingestion(
     if db_path is None:
         db_path = str(DEFAULT_DB_PATH)
 
-    logger.info(f"Starting rainfall ingestion: {start_date} to {end_date}")
+    from backend.quant_pro.ingest_cache import incremental_start
+
+    logger.info(f"Starting rainfall ingestion: fallback_start={start_date} end={end_date} force={force}")
     logger.info(f"Database: {db_path}")
 
     all_basin_rows = []
     summary = {}
 
     for basin_name, info in HYDRO_BASINS.items():
+        basin_start = (
+            start_date
+            if force
+            else incremental_start(
+                db_path,
+                sql="SELECT MAX(date) FROM weather_data WHERE basin = ?",
+                params=(basin_name,),
+                fallback_start=start_date,
+            )
+        )
+        if basin_start > end_date:
+            logger.info("%s already up to date through %s — skip", basin_name, end_date)
+            summary[basin_name] = 0
+            continue
         rows = fetch_basin_weather(
             basin_name=basin_name,
             lat=info["lat"],
             lon=info["lon"],
-            start_date=start_date,
+            start_date=basin_start,
             end_date=end_date,
         )
         all_basin_rows.extend(rows)
@@ -244,12 +262,17 @@ def main():
         "--db", type=str, default=None,
         help="Path to SQLite database. Default: nepse_market_data.db in project root"
     )
+    parser.add_argument(
+        "--force", action="store_true",
+        help="Re-fetch from --start instead of continuing from last stored date",
+    )
 
     args = parser.parse_args()
     summary = run_ingestion(
         start_date=args.start,
         end_date=args.end,
         db_path=args.db,
+        force=args.force,
     )
 
     print(f"\nDone. Summary: {json.dumps(summary, indent=2)}")

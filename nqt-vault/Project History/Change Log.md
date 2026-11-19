@@ -9,6 +9,8 @@ Append-only. Newest first. Link components you touched.
 
 ## 2026-11-20
 
+- Vault close-out made mandatory (`.cursor/rules/nqt-vault.mdc` + [[Vault Conventions]]); agents must update [[Change Log]] before claiming done.
+- Persist-first ingest: `.cursor/rules/data-persist.mdc` + `backend/quant_pro/ingest_cache.py` — skip/incremental for [[News Sentiment Pipeline]], gold/silver, rainfall, earnings `skip_existing` ([[Market Data Ingestion]], [[Data and Config]]).
 - [[News Sentiment Pipeline]]: optional proxy/Firecrawl fetch, nepali-xlmr + fin-qwen + Ollama LLM scoring, no look-ahead in signal, IC script, handoff doc `docs/research/NEWS_SENTIMENT_PIPELINE.md`.
 - Local Ollama default model → `qwen3:4b` ([[AI Setup]], [[AI Analyst]]).
 - [[Nepse Agents Graph]]: bounded Dexter-style research validate loop (max 2 rounds).

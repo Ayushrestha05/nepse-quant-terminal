@@ -15,4 +15,6 @@ tags: [architecture, data]
 
 Local paper accounts: `data/runtime/accounts/account_N/`.
 
+Ingest rule: fetch → SQLite → next run reads DB first (`ingest_cache.py`, Cursor `data-persist.mdc`). See [[Market Data Ingestion]], [[News Sentiment Pipeline]].
+
 Related: [[Architecture Overview]], [[Quick Start]].

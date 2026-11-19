@@ -23,12 +23,17 @@ obsidian vault=nqt-vault unresolved
 
 Prefer writing markdown files under `nqt-vault/` with `[[wikilinks]]` so the Obsidian Graph stays connected. Index: `00 - Index.md`.
 
-## After code changes
+## After EVERY completed task (mandatory)
 
-1. Append to `Project History/Change Log.md` (newest first).
-2. Touch linked Architecture/Components/Tabs notes.
+Do this before saying the work is done — not optional, even for small fixes/rules/installs.
+
+1. Append to `Project History/Change Log.md` (newest first) with `[[wikilinks]]`.
+2. Touch or create linked Architecture/Components/Tabs/Guides notes; link new ones from `00 - Index.md`.
 3. ADR if irreversible → `Decision Log.md`.
-4. Refresh code graph: `graphify update .` (see graphify skill / `./scripts/ops/recreate_graphify.sh`).
+4. Optional session note: `Project History/YYYY-MM-DD - Title.md`.
+5. Refresh code graph when structure changed: `graphify update .` (see graphify skill / `./scripts/ops/recreate_graphify.sh`).
+
+Project rule: `.cursor/rules/nqt-vault.mdc` (`alwaysApply`).
 
 ## Conventions
 

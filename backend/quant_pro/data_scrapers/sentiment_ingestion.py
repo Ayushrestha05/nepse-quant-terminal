@@ -797,15 +797,36 @@ def aggregate_and_store(
 
 # --- Main pipeline ---
 
+def _sources_needing_scrape(db_path: str, sources: List[str], *, force: bool) -> List[str]:
+    """Skip sources that already have today's sentiment_scores rows (unless force)."""
+    if force:
+        return list(sources)
+    from backend.quant_pro.ingest_cache import has_rows, today_iso
+
+    today = today_iso()
+    needed = []
+    for source in sources:
+        if has_rows(
+            db_path,
+            "SELECT COUNT(*) FROM sentiment_scores WHERE date = ? AND source = ?",
+            (today, source),
+        ):
+            logger.info("Skip %s scrape — sentiment_scores already has %s", source, today)
+            continue
+        needed.append(source)
+    return needed
+
+
 def run_sentiment_pipeline(
     pages: int = 3,
     model: str = "auto",
     db_path: str = str(DEFAULT_DB_PATH),
     sources: Optional[List[str]] = None,
+    force: bool = False,
 ) -> int:
     """
     Full sentiment ingestion pipeline:
-    1. Scrape news from MeroLagani and/or ShareSansar
+    1. Scrape news from MeroLagani and/or ShareSansar (skip source if today's scores exist)
     2. Score with NLP model (XLM-RoBERTa or keyword fallback)
     3. Aggregate and store in sentiment_scores table
 
@@ -814,11 +835,17 @@ def run_sentiment_pipeline(
         model: auto | nepali-xlmr | fin-qwen | xlm-roberta | keyword | llm
         db_path: Path to SQLite database
         sources: List of sources to scrape ("merolagani", "sharesansar")
+        force: Re-scrape even when today's scores already exist
 
     Returns: Number of aggregated scores stored
     """
     if sources is None:
         sources = ["merolagani", "sharesansar"]
+
+    sources = _sources_needing_scrape(db_path, sources, force=force)
+    if not sources:
+        logger.info("All requested sources already cached for today (pass force=True to refresh)")
+        return 0
 
     all_articles = []
 
@@ -880,6 +907,10 @@ def main():
         "--keyword-only", action="store_true",
         help="Force keyword-based scoring (skip model download)"
     )
+    parser.add_argument(
+        "--force", action="store_true",
+        help="Re-scrape even when today's sentiment_scores already exist",
+    )
 
     args = parser.parse_args()
 
@@ -890,6 +921,7 @@ def main():
         model=model,
         db_path=args.db,
         sources=args.sources,
+        force=args.force,
     )
     print(f"\nDone. Stored {stored} aggregated sentiment scores.")
     return 0 if stored > 0 else 1

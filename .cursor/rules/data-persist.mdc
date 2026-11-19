@@ -1,0 +1,31 @@
+---
+description: Persist market data, news, and calculations; skip re-fetch when DB already has them
+alwaysApply: true
+---
+
+# Data persist (no re-fetch loops)
+
+Fetched market data, news/sentiment, macros, and expensive calculations must land in SQLite (or the project's existing store) before the feature is "done". Next run reads the store first.
+
+## Rules
+
+1. **Fetch → store → read.** Never leave a network scrape/API result only in memory or a one-shot log.
+2. **Skip if fresh.** Before HTTP, check the DB for today's (or last) coverage. Honor `--force` / `force=True` to bypass.
+3. **Incremental > full history.** Prefer `start = max(stored_date) + 1` over re-downloading years you already have.
+4. **Calcs from local data** (signals from prices already in DB) may recompute, but if the result is reused across processes/days, write a dated snapshot (table or runtime JSON) and reuse it.
+5. **Reuse existing tables** (`stock_prices`, `sentiment_scores`, `news`, `news_event_scores`, `macro_indicators`, `weather_data`, floorsheet/broker scores). Do not invent a parallel cache unless nothing fits.
+
+## Examples
+
+```python
+# BAD — scrape every call, discard
+articles = scrape_merolagani_news()
+return score(articles)
+
+# GOOD — skip when today's scores exist; else scrape, score, INSERT
+if has_today_scores(db, source) and not force:
+    return 0
+store(aggregate(score(scrape())))
+```
+
+See `backend/quant_pro/ingest_cache.py` for shared "max date / has rows" helpers.

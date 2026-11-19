@@ -51,7 +51,10 @@ python3 -m backend.quant_pro.data_scrapers.sentiment_ingestion --model nepali-xl
 python3 -m backend.quant_pro.data_scrapers.sentiment_ingestion --model fin-qwen
 python3 -m backend.quant_pro.data_scrapers.sentiment_ingestion --model llm
 python3 -m backend.quant_pro.data_scrapers.sentiment_ingestion --model keyword
+python3 -m backend.quant_pro.data_scrapers.sentiment_ingestion --force   # bypass today's cache
 ```
+
+Cache: each source is skipped when `sentiment_scores` already has rows for **today** (unless `--force`).
 
 `auto` order: `nepali-xlmr` → `fin-qwen` → `xlm-roberta` → keyword.
 

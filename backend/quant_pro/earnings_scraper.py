@@ -1155,6 +1155,21 @@ def scrape_all_earnings(
     session = _new_session()
     stats = {"total_scraped": 0, "total_rows": 0, "errors": 0, "skipped": 0}
 
+    # Latest (fiscal_year, quarter) already in DB — skip symbols that have it.
+    latest_fy_q = None
+    if skip_existing:
+        try:
+            conn = sqlite3.connect(db_path)
+            latest_fy_q = conn.execute(
+                """
+                SELECT fiscal_year, quarter FROM quarterly_earnings
+                ORDER BY fiscal_year DESC, quarter DESC LIMIT 1
+                """
+            ).fetchone()
+            conn.close()
+        except Exception as e:
+            logger.debug("Could not read latest quarter for skip_existing: %s", e)
+
     # Load company ID map from ShareSansar (one request)
     try:
         _load_sharesansar_company_map(session)
@@ -1162,6 +1177,25 @@ def scrape_all_earnings(
         logger.warning("Failed to load ShareSansar company map: %s", e)
 
     for i, symbol in enumerate(symbols):
+        if skip_existing and latest_fy_q:
+            try:
+                conn = sqlite3.connect(db_path)
+                have = conn.execute(
+                    """
+                    SELECT 1 FROM quarterly_earnings
+                    WHERE symbol = ? AND fiscal_year = ? AND quarter = ?
+                    LIMIT 1
+                    """,
+                    (symbol, latest_fy_q[0], latest_fy_q[1]),
+                ).fetchone()
+                conn.close()
+            except Exception:
+                have = None
+            if have:
+                logger.info("[%d/%d] Skip %s — already has %s Q%s", i + 1, len(symbols), symbol, latest_fy_q[0], latest_fy_q[1])
+                stats["skipped"] += 1
+                continue
+
         logger.info("[%d/%d] Scraping %s...", i + 1, len(symbols), symbol)
 
         try:
@@ -1179,8 +1213,8 @@ def scrape_all_earnings(
             stats["errors"] += 1
 
     logger.info(
-        "Scraping complete: %d symbols, %d rows, %d errors",
-        stats["total_scraped"], stats["total_rows"], stats["errors"],
+        "Scraping complete: %d symbols, %d rows, %d skipped, %d errors",
+        stats["total_scraped"], stats["total_rows"], stats["skipped"], stats["errors"],
     )
     return stats
 

@@ -1,17 +1,25 @@
 ---
-description: NEPSE Quant Terminal Obsidian vault — document app changes with wikilinks
+description: ALWAYS update nqt-vault after completing any task — mandatory before claiming done
 alwaysApply: true
 ---
 
-# nqt-vault
+# nqt-vault (mandatory close-out)
 
-Vault path: `nqt-vault/` (repo root). Manage with Obsidian CLI (`obsidian vault=nqt-vault …`).
+Vault: `nqt-vault/` at repo root. Follow `.cursor/skills/nqt-vault/SKILL.md`.
 
-When you finish a feature, fix, or architecture change:
+**Do not mark a task complete, say "done", or stop a multi-step session until the vault is updated.** This is part of the work, not optional polish.
 
-1. Append a dated bullet to `nqt-vault/Project History/Change Log.md` with `[[wikilinks]]` to touched component notes.
-2. Update or add the relevant note under Architecture / Components / Tabs (keep links bidirectional where useful).
-3. For irreversible choices, add an ADR to `Decision Log.md` (never edit accepted ADRs — supersede).
-4. Optional session note: `Project History/YYYY-MM-DD - Title.md`.
+## Every completed task (feature, fix, install, research doc, rule)
 
-Do not put graphify HTML/JSON into the vault git tree; export only into the gitignored `Graphify/export/` folder.
+1. Append a newest-first bullet to `nqt-vault/Project History/Change Log.md` with `[[wikilinks]]` to touched notes.
+2. Update or create the matching note under Architecture / Components / Tabs / Guides (bidirectional links where useful).
+3. Link new components from `nqt-vault/00 - Index.md` when you add a note.
+4. Irreversible choice → new ADR in `Decision Log.md` (never edit an accepted ADR; supersede).
+5. Optional session note: `Project History/YYYY-MM-DD - Title.md`.
+
+## Do not
+
+- Skip the vault because the change was "small" or "just a rule/install".
+- Commit graphify HTML/JSON into the vault; keep artifacts gitignored.
+
+If you cannot update the vault (permissions, etc.), say so explicitly before finishing — do not silently skip.

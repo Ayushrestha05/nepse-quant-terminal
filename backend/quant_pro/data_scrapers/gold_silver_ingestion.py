@@ -123,26 +123,48 @@ def _download_yfinance(
         return None
 
 
+def _macro_start(db_path: str, indicator_name: str, fallback_start: str) -> str:
+    from backend.quant_pro.ingest_cache import incremental_start
+
+    return incremental_start(
+        db_path,
+        sql="SELECT MAX(date) FROM macro_indicators WHERE indicator_name = ?",
+        params=(indicator_name,),
+        fallback_start=fallback_start,
+    )
+
+
 def fetch_gold_silver(
     years: int = 5,
     db_path: str = DEFAULT_DB_PATH,
+    force: bool = False,
 ) -> Dict[str, int]:
     """
     Download XAU/USD and XAG/USD from yfinance and store in macro_indicators.
 
+    Incremental by default: each series starts at max(stored_date)+1.
+    Pass force=True to re-pull the full `years` window.
+
     Returns a dict with counts of rows inserted/updated per indicator.
     """
     end_date = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
-    start_date = (datetime.now(tz=timezone.utc) - timedelta(days=years * 365)).strftime("%Y-%m-%d")
-
-    logger.info("Fetching gold/silver prices (%s → %s)...", start_date, end_date)
+    fallback_start = (datetime.now(tz=timezone.utc) - timedelta(days=years * 365)).strftime("%Y-%m-%d")
 
     conn = sqlite3.connect(db_path, timeout=60)
     _ensure_macro_table(conn)
     counts: Dict[str, int] = {}
 
+    def _start(indicator: str) -> str:
+        return fallback_start if force else _macro_start(db_path, indicator, fallback_start)
+
     # ---- Gold: GC=F --------------------------------------------------------
-    gold_df = _download_yfinance("GC=F", start_date, end_date)
+    start_date = _start("gold_usd_per_oz")
+    if start_date > end_date:
+        logger.info("Gold already up to date through %s — skip download", end_date)
+        gold_df = None
+    else:
+        logger.info("Fetching gold (%s → %s)...", start_date, end_date)
+        gold_df = _download_yfinance("GC=F", start_date, end_date)
     if gold_df is not None and "close" in gold_df.columns:
         gold_df = gold_df[["date", "close"]].dropna().sort_values("date")
         gold_df["return"] = np.log(gold_df["close"] / gold_df["close"].shift(1))
@@ -157,7 +179,13 @@ def fetch_gold_silver(
         logger.warning("Gold data unavailable from yfinance")
 
     # ---- Silver: SI=F ------------------------------------------------------
-    silver_df = _download_yfinance("SI=F", start_date, end_date)
+    start_date = _start("silver_usd_per_oz")
+    if start_date > end_date:
+        logger.info("Silver already up to date through %s — skip download", end_date)
+        silver_df = None
+    else:
+        logger.info("Fetching silver (%s → %s)...", start_date, end_date)
+        silver_df = _download_yfinance("SI=F", start_date, end_date)
     if silver_df is not None and "close" in silver_df.columns:
         silver_df = silver_df[["date", "close"]].dropna().sort_values("date")
         silver_df["return"] = np.log(silver_df["close"] / silver_df["close"].shift(1))
@@ -172,7 +200,13 @@ def fetch_gold_silver(
         logger.warning("Silver data unavailable from yfinance")
 
     # ---- USD/NPR: USDNPR=X -------------------------------------------------
-    fx_df = _download_yfinance("USDNPR=X", start_date, end_date)
+    start_date = _start("usd_npr_rate")
+    if start_date > end_date:
+        logger.info("USD/NPR already up to date through %s — skip download", end_date)
+        fx_df = None
+    else:
+        logger.info("Fetching USD/NPR (%s → %s)...", start_date, end_date)
+        fx_df = _download_yfinance("USDNPR=X", start_date, end_date)
     if fx_df is not None and "close" in fx_df.columns and len(fx_df) > 10:
         fx_df = fx_df[["date", "close"]].dropna().sort_values("date")
         n_fx = _upsert_series(conn, fx_df, "date", "close", "usd_npr_rate", "yfinance:USDNPR=X")
@@ -537,9 +571,10 @@ def main():
     )
     parser.add_argument("--years", type=int, default=5, help="Years of history to fetch (default: 5)")
     parser.add_argument("--db", default=DEFAULT_DB_PATH, help="Path to SQLite database")
+    parser.add_argument("--force", action="store_true", help="Re-download full window instead of incremental")
     args = parser.parse_args()
 
-    counts = fetch_gold_silver(years=args.years, db_path=args.db)
+    counts = fetch_gold_silver(years=args.years, db_path=args.db, force=args.force)
     print("\nIngestion complete:")
     for name, n in counts.items():
         print(f"  {name}: {n} rows")
