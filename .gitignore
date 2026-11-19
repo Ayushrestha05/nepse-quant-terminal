@@ -17,6 +17,10 @@ data/
 # === Artifacts (generated reports, screenshots) ===
 artifacts/
 
+# === Graphify (local knowledge graph — regenerate, never review) ===
+graphify-out/
+nqt-vault/Graphify/export/
+
 # === Python ===
 __pycache__/
 *.py[cod]
@@ -55,6 +59,9 @@ Thumbs.db
 .vscode/
 *.swp
 *.swo
+
+# Obsidian workspace noise under plain docs/ (vault is nqt-vault/)
+docs/.obsidian/
 
 # === Jupyter ===
 .ipynb_checkpoints/

@@ -1,0 +1,17 @@
+---
+description: NEPSE Quant Terminal Obsidian vault — document app changes with wikilinks
+alwaysApply: true
+---
+
+# nqt-vault
+
+Vault path: `nqt-vault/` (repo root). Manage with Obsidian CLI (`obsidian vault=nqt-vault …`).
+
+When you finish a feature, fix, or architecture change:
+
+1. Append a dated bullet to `nqt-vault/Project History/Change Log.md` with `[[wikilinks]]` to touched component notes.
+2. Update or add the relevant note under Architecture / Components / Tabs (keep links bidirectional where useful).
+3. For irreversible choices, add an ADR to `Decision Log.md` (never edit accepted ADRs — supersede).
+4. Optional session note: `Project History/YYYY-MM-DD - Title.md`.
+
+Do not put graphify HTML/JSON into the vault git tree; export only into the gitignored `Graphify/export/` folder.

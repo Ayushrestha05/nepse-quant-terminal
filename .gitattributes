@@ -1,0 +1,8 @@
+# Graphify artifacts: never surface in GitHub language stats / PR review chrome.
+# Prefer keeping them untracked via .gitignore. If force-added, hide + refuse merges.
+graphify-out/** linguist-generated=true
+graphify-out/** -diff
+graphify-out/** merge=ours
+nqt-vault/Graphify/export/** linguist-generated=true
+nqt-vault/Graphify/export/** -diff
+nqt-vault/Graphify/export/** merge=ours

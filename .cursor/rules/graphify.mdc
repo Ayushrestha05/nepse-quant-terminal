@@ -1,0 +1,37 @@
+---
+description: graphify knowledge graph context + conflict recreate policy
+alwaysApply: true
+---
+
+# Graphify
+
+This project has a local graphify knowledge graph at `graphify-out/` (gitignored).
+
+## Before exploring code
+
+Prefer graphify over blind Read/Grep/Glob for architecture questions:
+
+- `graphify query "<question>"`
+- `graphify path "<A>" "<B>"`
+- `graphify explain "<concept>"`
+
+Skip only when (1) graphify already oriented you and you need exact lines to edit, or (2) `graphify-out/graph.json` is missing — then run `./scripts/ops/recreate_graphify.sh` (or `graphify extract . --code-only`).
+
+After meaningful code edits: `graphify update .`.
+
+## Git / PR / merge conflicts
+
+- **Never** stage or commit `graphify-out/` or `docs/nqt-vault/Graphify/export/`.
+- They must **not** appear in GitHub PR review. Do not force-add them.
+- If a merge/rebase conflicts on any graphify artifact, or conflict markers appear under those paths:
+
+```bash
+rm -rf graphify-out nqt-vault/Graphify/export
+./scripts/ops/recreate_graphify.sh
+```
+
+Do **not** hand-merge `graph.json`, `graph.html`, or `GRAPH_REPORT.md`.
+
+## Vault
+
+Product docs live in Obsidian vault `nqt-vault/` (wikilinks). Track shipped work in `[[Change Log]]`. Skill: `.cursor/skills/nqt-vault/SKILL.md`.
