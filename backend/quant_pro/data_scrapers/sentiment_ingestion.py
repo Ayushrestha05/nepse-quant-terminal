@@ -2,26 +2,32 @@
 Sentiment data ingestion from MeroLagani and ShareSansar news.
 
 Scrapes NEPSE-related news headlines, scores them using NLP models
-(XLM-RoBERTa multilingual or keyword-based fallback), and stores
+(XLM-RoBERTa / fin-qwen / Ollama LLM or keyword fallback), and stores
 aggregated daily sentiment scores in the sentiment_scores table.
 
 Usage:
     python3 -m backend.quant_pro.data_scrapers.sentiment_ingestion
     python3 -m backend.quant_pro.data_scrapers.sentiment_ingestion --pages 5 --model keyword
-    python3 -m backend.quant_pro.data_scrapers.sentiment_ingestion --symbol NABIL --days 7
+    python3 -m backend.quant_pro.data_scrapers.sentiment_ingestion --model llm
 
 Sources:
     - MeroLagani news: https://merolagani.com/NewsList.aspx
     - ShareSansar news: https://www.sharesansar.com/category/latest
 
-Models (in priority order):
-    1. cardiffnlp/twitter-xlm-roberta-base-sentiment (multilingual, Nepali-capable)
-    2. Keyword-based fallback (Nepali + English financial keywords)
+Models (auto priority):
+    1. AurevinP/xlm-roberta-base-nepali-sentiment-v1 (nepali-xlmr)
+    2. NOSIBLE/financial-sentiment-v1.2-base (fin-qwen)
+    3. cardiffnlp/twitter-xlm-roberta-base-sentiment (xlm-roberta)
+    4. Keyword fallback
+
+Optional: --model llm uses local Ollama for tickers + event_type + sentiment.
+Fetcher: urllib → NQT_PROXIES → FIRECRAWL_API_KEY (all optional).
 """
 
 import argparse
 import json
 import logging
+import os
 import re
 import sqlite3
 import sys
@@ -29,8 +35,8 @@ import time
 from datetime import datetime, timezone, timedelta
 from html import unescape
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
-from urllib.request import urlopen, Request
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.request import ProxyHandler, Request, build_opener, urlopen
 from urllib.error import URLError, HTTPError
 from backend.quant_pro.paths import get_data_dir
 
@@ -95,6 +101,35 @@ def _load_symbols_from_db(db_path: str) -> set:
         return set()
 
 
+_CACHED_NAME_MAP: Optional[Dict[str, str]] = None
+
+
+def _load_name_to_symbol(db_path: str) -> Dict[str, str]:
+    """Map lowercased company/security names → ticker from market_quotes."""
+    global _CACHED_NAME_MAP
+    if _CACHED_NAME_MAP is not None:
+        return _CACHED_NAME_MAP
+    mapping: Dict[str, str] = {}
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT symbol, security_name FROM market_quotes
+            WHERE security_name IS NOT NULL AND TRIM(security_name) != ''
+            """
+        )
+        for symbol, name in cursor.fetchall():
+            key = str(name or "").strip().lower()
+            if key and symbol:
+                mapping[key] = str(symbol).upper()
+        conn.close()
+    except Exception as e:
+        logger.debug("name→symbol map unavailable: %s", e)
+    _CACHED_NAME_MAP = mapping
+    return mapping
+
+
 def _extract_symbols_from_text(text: str, known_symbols: set) -> List[str]:
     """Extract stock symbols mentioned in text."""
     found = []
@@ -106,24 +141,108 @@ def _extract_symbols_from_text(text: str, known_symbols: set) -> List[str]:
     return found
 
 
-# --- Scrapers ---
+def _proxy_list() -> List[str]:
+    raw = (os.environ.get("NQT_PROXIES") or "").strip()
+    if not raw:
+        return []
+    # ponytail: free proxies are flaky and can tamper with traffic; rotate + skip failures only
+    return [p.strip() for p in raw.split(",") if p.strip()]
 
-def _fetch_url(url: str, timeout: int = 15) -> str:
-    """Fetch a URL with user-agent header and timeout."""
-    headers = {
+
+def _default_headers() -> Dict[str, str]:
+    return {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                       "AppleWebKit/537.36 (KHTML, like Gecko) "
-                       "Chrome/120.0.0.0 Safari/537.36",
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/120.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.5,ne;q=0.3",
     }
-    req = Request(url, headers=headers)
-    try:
-        with urlopen(req, timeout=timeout) as resp:
+
+
+def _fetch_via_urllib(url: str, timeout: int, proxy: Optional[str] = None) -> str:
+    req = Request(url, headers=_default_headers())
+    if proxy:
+        opener = build_opener(ProxyHandler({"http": proxy, "https": proxy}))
+        with opener.open(req, timeout=timeout) as resp:
             return resp.read().decode("utf-8", errors="replace")
-    except (URLError, HTTPError) as e:
-        logger.warning(f"Failed to fetch {url}: {e}")
+    with urlopen(req, timeout=timeout) as resp:
+        return resp.read().decode("utf-8", errors="replace")
+
+
+def _fetch_via_firecrawl(url: str, timeout: int = 60) -> str:
+    """Optional Firecrawl cloud scrape when FIRECRAWL_API_KEY is set."""
+    api_key = (os.environ.get("FIRECRAWL_API_KEY") or "").strip()
+    if not api_key:
         return ""
+    endpoint = (os.environ.get("FIRECRAWL_API_URL") or "https://api.firecrawl.dev/v1/scrape").strip()
+    body = json.dumps({"url": url, "formats": ["html"], "onlyMainContent": False}).encode("utf-8")
+    req = Request(
+        endpoint,
+        data=body,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    with urlopen(req, timeout=timeout) as resp:
+        payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if isinstance(data, dict):
+        html = data.get("html") or data.get("rawHtml") or ""
+        if html:
+            return str(html)
+        markdown = data.get("markdown") or ""
+        if markdown:
+            return f"<html><body><pre>{markdown}</pre></body></html>"
+    return ""
+
+
+def _is_block_error(exc: BaseException) -> bool:
+    if isinstance(exc, HTTPError) and exc.code in (403, 429, 503):
+        return True
+    if isinstance(exc, (TimeoutError,)):
+        return True
+    if isinstance(exc, URLError):
+        reason = getattr(exc, "reason", None)
+        if isinstance(reason, (TimeoutError,)):
+            return True
+        msg = str(reason or exc).lower()
+        return "timed out" in msg or "timeout" in msg
+    return False
+
+
+# --- Scrapers ---
+
+def _fetch_url(url: str, timeout: int = 15) -> str:
+    """Fetch URL: direct urllib → NQT_PROXIES → optional Firecrawl."""
+    try:
+        return _fetch_via_urllib(url, timeout=timeout)
+    except (URLError, HTTPError, TimeoutError) as e:
+        if not _is_block_error(e):
+            logger.warning("Failed to fetch %s: %s", url, e)
+            return ""
+        logger.info("Direct fetch blocked for %s (%s); trying proxies/Firecrawl", url, e)
+
+    for proxy in _proxy_list():
+        try:
+            html = _fetch_via_urllib(url, timeout=timeout, proxy=proxy)
+            if html:
+                return html
+        except (URLError, HTTPError, TimeoutError) as e:
+            logger.debug("Proxy %s failed for %s: %s", proxy, url, e)
+            continue
+
+    if (os.environ.get("FIRECRAWL_API_KEY") or "").strip():
+        try:
+            html = _fetch_via_firecrawl(url)
+            if html:
+                return html
+        except (URLError, HTTPError, TimeoutError, ValueError, json.JSONDecodeError) as e:
+            logger.warning("Firecrawl failed for %s: %s", url, e)
+
+    logger.warning("Failed to fetch %s after urllib/proxy/Firecrawl", url)
+    return ""
 
 
 def scrape_merolagani_news(pages: int = 3) -> List[Dict]:
@@ -241,67 +360,91 @@ def scrape_sharesansar_news(pages: int = 3) -> List[Dict]:
 
 # --- Sentiment Scoring ---
 
-def _load_xlm_roberta():
-    """
-    Load XLM-RoBERTa sentiment model.
-    Returns (pipeline, model_name) or (None, None) if loading fails.
-    """
+HF_MODELS = {
+    "nepali-xlmr": ("AurevinP/xlm-roberta-base-nepali-sentiment-v1", "nepali-xlmr"),
+    "fin-qwen": ("NOSIBLE/financial-sentiment-v1.2-base", "fin-qwen"),
+    "xlm-roberta": ("cardiffnlp/twitter-xlm-roberta-base-sentiment", "xlm-roberta-base-sentiment"),
+}
+
+AUTO_MODEL_ORDER = ("nepali-xlmr", "fin-qwen", "xlm-roberta")
+
+
+def _load_hf_classifier(model_id: str, short_name: str):
+    """Load a HF sentiment pipeline. Returns (pipeline, short_name) or (None, None)."""
     try:
         from transformers import pipeline as hf_pipeline
-        logger.info("Loading cardiffnlp/twitter-xlm-roberta-base-sentiment...")
+        logger.info("Loading %s...", model_id)
         classifier = hf_pipeline(
             "sentiment-analysis",
-            model="cardiffnlp/twitter-xlm-roberta-base-sentiment",
-            top_k=None,  # Return all labels with scores
+            model=model_id,
+            top_k=None,
             truncation=True,
             max_length=512,
         )
-        logger.info("XLM-RoBERTa model loaded successfully")
-        return classifier, "xlm-roberta-base-sentiment"
+        logger.info("%s loaded", short_name)
+        return classifier, short_name
     except Exception as e:
-        logger.warning(f"Failed to load XLM-RoBERTa: {e}")
+        logger.warning("Failed to load %s: %s", model_id, e)
         return None, None
 
 
+def _load_xlm_roberta():
+    """Back-compat: load cardiffnlp XLM-R."""
+    model_id, short = HF_MODELS["xlm-roberta"]
+    return _load_hf_classifier(model_id, short)
+
+
+def _label_to_score(label_scores: Dict[str, float]) -> Dict:
+    """Map classifier label probs to score/confidence/label on [-1, 1]."""
+    # Normalize common label aliases
+    normalized: Dict[str, float] = {}
+    for raw, val in label_scores.items():
+        key = raw.lower().replace(" ", "_").replace("-", "_")
+        if key in ("label_2", "pos", "positive", "bullish", "very_positive"):
+            normalized["positive"] = max(normalized.get("positive", 0.0), float(val))
+        elif key in ("label_0", "neg", "negative", "bearish", "very_negative"):
+            normalized["negative"] = max(normalized.get("negative", 0.0), float(val))
+        elif key in ("label_1", "neu", "neutral"):
+            normalized["neutral"] = max(normalized.get("neutral", 0.0), float(val))
+        else:
+            normalized[key] = float(val)
+
+    pos = normalized.get("positive", 0.0)
+    neg = normalized.get("negative", 0.0)
+    neu = normalized.get("neutral", 0.0)
+    score = pos - neg
+    confidence = max(pos, neg, neu, 0.0) or max(label_scores.values(), default=0.0)
+    if score > 0.1:
+        label = "positive"
+    elif score < -0.1:
+        label = "negative"
+    else:
+        label = "neutral"
+    return {
+        "score": round(float(score), 4),
+        "confidence": round(float(confidence), 4),
+        "label": label,
+    }
+
+
 def score_with_xlm_roberta(texts: List[str], classifier) -> List[Dict]:
-    """
-    Score texts using XLM-RoBERTa sentiment model.
-    Returns list of dicts with keys: score (-1 to +1), confidence (0-1), label
-    """
+    """Score texts with a HF sentiment pipeline (any of the supported models)."""
     results = []
-    # Process in batches to avoid memory issues
     batch_size = 16
     for i in range(0, len(texts), batch_size):
         batch = texts[i:i + batch_size]
         try:
             outputs = classifier(batch)
             for output in outputs:
-                # output is a list of dicts: [{"label": "positive", "score": 0.8}, ...]
                 if isinstance(output, list):
                     label_scores = {item["label"].lower(): item["score"] for item in output}
                 else:
                     label_scores = {output["label"].lower(): output["score"]}
-
-                # Map to -1 to +1 scale
-                pos = label_scores.get("positive", 0.0)
-                neg = label_scores.get("negative", 0.0)
-                neu = label_scores.get("neutral", 0.0)
-
-                # Weighted score: positive contributes +1, negative -1, neutral 0
-                score = pos - neg
-                confidence = max(pos, neg, neu)
-
-                results.append({
-                    "score": round(score, 4),
-                    "confidence": round(confidence, 4),
-                    "label": max(label_scores, key=label_scores.get),
-                })
+                results.append(_label_to_score(label_scores))
         except Exception as e:
-            logger.warning(f"XLM-RoBERTa batch scoring failed: {e}")
-            # Fall back to keyword for this batch
+            logger.warning("HF batch scoring failed: %s", e)
             for text in batch:
                 results.append(score_with_keywords(text))
-
     return results
 
 
@@ -331,41 +474,203 @@ def score_with_keywords(text: str) -> Dict:
     return {"score": round(score, 4), "confidence": round(confidence, 4), "label": label}
 
 
+def parse_llm_sentiment_json(raw: str) -> Dict[str, Any]:
+    """Parse Ollama JSON into tickers/event_type/sentiment/confidence. Pure helper for tests."""
+    text = (raw or "").strip()
+    if not text:
+        raise ValueError("empty LLM response")
+    # Strip markdown fences if present
+    fence = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.S)
+    if fence:
+        text = fence.group(1)
+    else:
+        start, end = text.find("{"), text.rfind("}")
+        if start >= 0 and end > start:
+            text = text[start:end + 1]
+    data = json.loads(text)
+    if not isinstance(data, dict):
+        raise ValueError("LLM JSON root is not an object")
+
+    tickers_raw = data.get("tickers") or data.get("symbols") or []
+    if isinstance(tickers_raw, str):
+        tickers_raw = [t.strip() for t in tickers_raw.split(",") if t.strip()]
+    tickers = [str(t).upper().strip() for t in tickers_raw if str(t).strip()]
+
+    sentiment = str(data.get("sentiment") or data.get("label") or "neutral").lower().strip()
+    if sentiment in ("pos", "bullish", "very_positive", "positive"):
+        label, score = "positive", 0.7
+    elif sentiment in ("neg", "bearish", "very_negative", "negative"):
+        label, score = "negative", -0.7
+    else:
+        label, score = "neutral", 0.0
+
+    if "score" in data:
+        try:
+            score = max(-1.0, min(1.0, float(data["score"])))
+        except (TypeError, ValueError):
+            pass
+        label = "positive" if score > 0.1 else "negative" if score < -0.1 else "neutral"
+
+    try:
+        confidence = max(0.0, min(1.0, float(data.get("confidence", 0.5))))
+    except (TypeError, ValueError):
+        confidence = 0.5
+
+    event_type = str(data.get("event_type") or data.get("event") or "other").strip().lower() or "other"
+    return {
+        "tickers": tickers,
+        "event_type": event_type,
+        "score": round(score, 4),
+        "confidence": round(confidence, 4),
+        "label": label,
+    }
+
+
+def map_names_to_tickers(text: str, name_map: Dict[str, str]) -> List[str]:
+    """Match company names inside text to tickers (longest name first)."""
+    if not text or not name_map:
+        return []
+    lowered = text.lower()
+    hits = []
+    for name in sorted(name_map.keys(), key=len, reverse=True):
+        if len(name) < 4:
+            continue
+        if name in lowered:
+            hits.append(name_map[name])
+    # de-dupe preserve order
+    seen = set()
+    out = []
+    for t in hits:
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
+
+
+def score_with_llm(
+    articles: List[Dict],
+    *,
+    db_path: str,
+    known_symbols: Optional[set] = None,
+) -> Optional[List[Dict]]:
+    """Score via Ollama. Returns None if Ollama unavailable (caller falls back)."""
+    try:
+        from backend.agents.llm_ollama import SUGGESTED_MODEL, call_ollama
+    except Exception as e:
+        logger.warning("Ollama client unavailable: %s", e)
+        return None
+
+    if known_symbols is None:
+        known_symbols = _load_symbols_from_db(db_path)
+    name_map = _load_name_to_symbol(db_path)
+    # Compact name list for the prompt (cap size)
+    sample_names = sorted(name_map.items(), key=lambda kv: len(kv[0]), reverse=True)[:80]
+    name_hint = "; ".join(f"{name}={sym}" for name, sym in sample_names)
+
+    system = (
+        "You score NEPSE financial news. Reply with ONLY one JSON object: "
+        '{"tickers":["SYM"],"event_type":"earnings|dividend|ipo|macro|other",'
+        '"sentiment":"positive|neutral|negative","score":-1.0_to_1.0,"confidence":0.0_to_1.0}. '
+        "Map company names to NEPSE tickers when possible."
+    )
+    results = []
+    model_name = f"ollama-{SUGGESTED_MODEL}"
+    for article in articles:
+        title = article.get("title") or ""
+        prompt = f"Known name→ticker samples: {name_hint}\n\nHeadline: {title}"
+        raw = call_ollama(
+            prompt,
+            system=system,
+            max_tokens=200,
+            model=SUGGESTED_MODEL,
+            purpose="chat",
+            temperature=0.1,
+        )
+        if not raw or str(raw).startswith("ERROR:"):
+            logger.warning("Ollama scoring failed: %s", raw)
+            return None
+        try:
+            parsed = parse_llm_sentiment_json(str(raw))
+        except (ValueError, json.JSONDecodeError) as e:
+            logger.debug("LLM JSON parse failed (%s); keyword fallback for one article", e)
+            parsed = {**score_with_keywords(title), "tickers": [], "event_type": "other"}
+
+        tickers = list(parsed.get("tickers") or [])
+        tickers.extend(_extract_symbols_from_text(title, known_symbols))
+        tickers.extend(map_names_to_tickers(title, name_map))
+        # keep only known symbols when we have a universe
+        if known_symbols:
+            tickers = [t for t in dict.fromkeys(tickers) if t in known_symbols]
+        else:
+            tickers = list(dict.fromkeys(tickers))
+
+        results.append({
+            "score": parsed["score"],
+            "confidence": parsed["confidence"],
+            "label": parsed["label"],
+            "tickers": tickers,
+            "event_type": parsed.get("event_type", "other"),
+            "model_name": model_name,
+        })
+        time.sleep(0.05)
+    return results
+
+
+def _resolve_classifier(model: str):
+    """Return (classifier, model_name) for HF path, or (None, 'keyword')."""
+    if model == "keyword":
+        return None, "keyword"
+    keys = AUTO_MODEL_ORDER if model == "auto" else (model,)
+    for key in keys:
+        if key not in HF_MODELS:
+            continue
+        model_id, short = HF_MODELS[key]
+        classifier, loaded = _load_hf_classifier(model_id, short)
+        if classifier is not None:
+            return classifier, loaded
+        if model != "auto":
+            break
+    return None, "keyword"
+
+
 def score_articles(
     articles: List[Dict],
     model: str = "auto",
+    db_path: str = str(DEFAULT_DB_PATH),
 ) -> List[Dict]:
     """
     Score articles using the specified or best available model.
 
-    Args:
-        articles: List of article dicts with 'title' key
-        model: "xlm-roberta", "keyword", or "auto" (try xlm first)
-
-    Returns: articles with added keys: score, confidence, label, model_name
+    model: auto | nepali-xlmr | fin-qwen | xlm-roberta | keyword | llm
     """
     if not articles:
         return []
 
-    classifier = None
-    model_name = "keyword"
+    if model == "llm":
+        llm_scores = score_with_llm(articles, db_path=db_path)
+        if llm_scores is not None:
+            for article, score_dict in zip(articles, llm_scores):
+                article["sentiment_score"] = score_dict["score"]
+                article["sentiment_confidence"] = score_dict["confidence"]
+                article["sentiment_label"] = score_dict["label"]
+                article["model_name"] = score_dict["model_name"]
+                article["llm_tickers"] = score_dict.get("tickers") or []
+                article["event_type"] = score_dict.get("event_type") or "other"
+            return articles
+        logger.warning("LLM scoring unavailable; falling back to auto classifier")
+        model = "auto"
 
-    if model in ("auto", "xlm-roberta"):
-        classifier, loaded_name = _load_xlm_roberta()
-        if classifier is not None:
-            model_name = loaded_name
-
+    classifier, model_name = _resolve_classifier(model)
     texts = [a["title"] for a in articles]
 
     if classifier is not None:
-        logger.info(f"Scoring {len(texts)} articles with {model_name}")
+        logger.info("Scoring %s articles with %s", len(texts), model_name)
         scores = score_with_xlm_roberta(texts, classifier)
     else:
-        logger.info(f"Scoring {len(texts)} articles with keyword-based scorer")
+        logger.info("Scoring %s articles with keyword-based scorer", len(texts))
         model_name = "keyword"
         scores = [score_with_keywords(t) for t in texts]
 
-    # Merge scores into articles
     for article, score_dict in zip(articles, scores):
         article["sentiment_score"] = score_dict["score"]
         article["sentiment_confidence"] = score_dict["confidence"]
@@ -378,7 +683,7 @@ def score_articles(
 # --- Aggregation and Storage ---
 
 def _parse_date(date_str: str) -> Optional[str]:
-    """Parse various date formats to YYYY-MM-DD."""
+    """Parse various date formats to YYYY-MM-DD (publication calendar day)."""
     if not date_str:
         return None
 
@@ -398,6 +703,19 @@ def _parse_date(date_str: str) -> Optional[str]:
     return None
 
 
+def _article_symbols(article: Dict, known_symbols: set, name_map: Dict[str, str]) -> List[str]:
+    """Prefer LLM tickers; else regex tickers + company-name hits."""
+    symbols: List[str] = []
+    for sym in article.get("llm_tickers") or []:
+        s = str(sym).upper().strip()
+        if s and (not known_symbols or s in known_symbols):
+            symbols.append(s)
+    title = article.get("title") or ""
+    symbols.extend(_extract_symbols_from_text(title, known_symbols))
+    symbols.extend(map_names_to_tickers(title, name_map))
+    return list(dict.fromkeys(symbols))
+
+
 def aggregate_and_store(
     articles: List[Dict],
     db_path: str,
@@ -406,10 +724,8 @@ def aggregate_and_store(
     """
     Aggregate scored articles by (date, symbol, source) and store in DB.
 
-    For each article:
-    1. Parse date
-    2. Extract mentioned symbols (if any)
-    3. Store per-symbol scores AND market-wide score (symbol=NULL)
+    `date` is the article's published_at calendar day (from date_str) so the
+    signal layer can enforce no look-ahead with date < trade_date.
     """
     if not articles:
         logger.warning("No articles to store")
@@ -417,19 +733,20 @@ def aggregate_and_store(
 
     if known_symbols is None:
         known_symbols = _load_symbols_from_db(db_path)
+    name_map = _load_name_to_symbol(db_path)
 
     now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     today = datetime.now().strftime("%Y-%m-%d")
 
-    # Group articles by (date, source, model)
-    # For each group, compute: mean score, mean confidence, count
     from collections import defaultdict
 
     # key = (date, symbol_or_none, source, model)
     groups = defaultdict(lambda: {"scores": [], "confidences": []})
 
     for article in articles:
-        date = _parse_date(article.get("date_str", "")) or today
+        published = _parse_date(article.get("date_str", ""))
+        article["published_at"] = published or today
+        date = article["published_at"]
         source = article.get("source", "unknown")
         model = article.get("model_name", "keyword")
         score = article.get("sentiment_score", 0.0)
@@ -440,9 +757,7 @@ def aggregate_and_store(
         groups[key]["scores"].append(score)
         groups[key]["confidences"].append(conf)
 
-        # Per-symbol entries
-        symbols = _extract_symbols_from_text(article.get("title", ""), known_symbols)
-        for sym in symbols:
+        for sym in _article_symbols(article, known_symbols, name_map):
             key = (date, sym, source, model)
             groups[key]["scores"].append(score)
             groups[key]["confidences"].append(conf)
@@ -496,7 +811,7 @@ def run_sentiment_pipeline(
 
     Args:
         pages: Number of pages to scrape per source
-        model: "auto", "xlm-roberta", or "keyword"
+        model: auto | nepali-xlmr | fin-qwen | xlm-roberta | keyword | llm
         db_path: Path to SQLite database
         sources: List of sources to scrape ("merolagani", "sharesansar")
 
@@ -522,7 +837,7 @@ def run_sentiment_pipeline(
     logger.info(f"Total articles scraped: {len(all_articles)}")
 
     # Score all articles
-    scored_articles = score_articles(all_articles, model=model)
+    scored_articles = score_articles(all_articles, model=model, db_path=db_path)
 
     # Log sentiment distribution
     scores = [a["sentiment_score"] for a in scored_articles]
@@ -547,8 +862,10 @@ def main():
         help="Number of pages to scrape per source (default: 3)"
     )
     parser.add_argument(
-        "--model", choices=["auto", "xlm-roberta", "keyword"], default="auto",
-        help="Sentiment model to use (default: auto = try xlm-roberta first)"
+        "--model",
+        choices=["auto", "nepali-xlmr", "fin-qwen", "xlm-roberta", "keyword", "llm"],
+        default="auto",
+        help="Sentiment model (default: auto = nepali-xlmr → fin-qwen → xlm-roberta → keyword)",
     )
     parser.add_argument(
         "--db", type=str, default=str(DEFAULT_DB_PATH),

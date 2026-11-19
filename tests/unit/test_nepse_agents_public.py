@@ -38,6 +38,8 @@ def test_public_agent_graph_approves_only_with_evidence_quorum(tmp_path):
     assert decision["final_quantity"] == 30
     assert decision["evidence_gate_ok"] is True
     assert state.checkpoint_path
+    assert state.validation_rounds
+    assert state.validation_rounds[-1]["action"] == "stop"
 
     ok, reason = decision_allows_paper_trade(decision)
     assert ok is True

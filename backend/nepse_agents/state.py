@@ -18,6 +18,7 @@ class NepseAgentState:
     risk_verdict: RiskVerdict | None = None
     portfolio_decision: PortfolioDecision | None = None
     evidence_quorum: dict[str, object] = field(default_factory=dict)
+    validation_rounds: list[dict] = field(default_factory=list)
     checkpoint_path: str = ""
     completed: bool = False
 
@@ -32,6 +33,7 @@ class NepseAgentState:
             "risk_verdict": self.risk_verdict.to_record() if self.risk_verdict else None,
             "portfolio_decision": self.portfolio_decision.to_record() if self.portfolio_decision else None,
             "evidence_quorum": dict(self.evidence_quorum),
+            "validation_rounds": list(self.validation_rounds),
             "checkpoint_path": self.checkpoint_path,
             "completed": self.completed,
         }

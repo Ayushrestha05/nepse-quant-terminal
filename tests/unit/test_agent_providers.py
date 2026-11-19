@@ -194,7 +194,7 @@ def test_ollama_matches_untagged_name_to_latest():
 def test_ollama_without_models_says_what_to_pull():
     fake = FakeUrlopen({"/api/tags": {"models": []}})
     answer = llm_ollama.call_ollama("q", system="s", max_tokens=10, model="llama3", host="http://x:1", urlopen=fake)
-    assert answer.startswith("ERROR:") and "ollama pull llama3.2" in answer
+    assert answer.startswith("ERROR:") and f"ollama pull {llm_ollama.SUGGESTED_MODEL}" in answer
     assert len(fake.requests) == 1  # no chat call attempted
 
 

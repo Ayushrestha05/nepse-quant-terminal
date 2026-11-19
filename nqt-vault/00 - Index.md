@@ -39,6 +39,7 @@ Keyboard-driven research and **paper-trading** terminal for the Nepal Stock Exch
 - [[Strategy Registry]]
 - [[AI Analyst]]
 - [[Nepse Agents Graph]]
+- [[News Sentiment Pipeline]]
 - [[Website Connect]]
 - [[Market Data Ingestion]]
 

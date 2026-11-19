@@ -27,7 +27,7 @@ from typing import Any, Callable, Optional
 from backend.agents.ai_settings import setting
 
 DEFAULT_OLLAMA_HOST = "http://localhost:11434"
-SUGGESTED_MODEL = "llama3.2"
+SUGGESTED_MODEL = "qwen3:4b"
 TAGS_TTL_S = 60.0
 TIMEOUTS_S = {"chat": 120.0, "analysis": 300.0}
 # Ollama's default context window silently cuts long prompts; ask for one that

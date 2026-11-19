@@ -28,6 +28,7 @@ class NepseAgentGraph:
         state.evidence_quorum = evidence_quorum(state.evidence)
         state.debate_log.extend(run_research_debate(envelope, state.evidence))
         state.research_plan = self._research_manager(state)
+        self._validate_research(state, max_rounds=2)
         state.trader_proposal = self._trader(state)
         state.debate_log.extend(run_risk_debate(envelope))
         state.risk_verdict = self._risk_committee(state)
@@ -35,6 +36,51 @@ class NepseAgentGraph:
         state.completed = True
         self._write_checkpoint(state)
         return state
+
+    def _validate_research(self, state: NepseAgentState, *, max_rounds: int = 2) -> None:
+        """Dexter-style bounded check: evidence vs plan; one more look or stop."""
+        for round_i in range(1, max_rounds + 1):
+            plan = state.research_plan
+            quorum = state.evidence_quorum or {}
+            missing = list(quorum.get("missing_roles") or [])
+            red_flags = list(quorum.get("red_flags") or [])
+            avg_conf = float(quorum.get("average_confidence") or 0.0)
+            needs_more = bool(missing) or (avg_conf < 0.45) or (bool(red_flags) and (plan is None or plan.confidence < 0.55))
+
+            if not needs_more:
+                state.validation_rounds.append(
+                    {
+                        "round": round_i,
+                        "action": "stop",
+                        "reason": "evidence covers the research plan",
+                        "average_confidence": avg_conf,
+                    }
+                )
+                return
+
+            # One more deterministic lookup: rebuild public evidence from candidate refs.
+            state.evidence = build_public_evidence(state.candidate)
+            state.evidence_quorum = evidence_quorum(state.evidence)
+            state.research_plan = self._research_manager(state)
+            state.validation_rounds.append(
+                {
+                    "round": round_i,
+                    "action": "recheck",
+                    "reason": "missing roles or weak confidence vs plan",
+                    "missing_roles": missing,
+                    "red_flags": red_flags,
+                    "average_confidence": avg_conf,
+                }
+            )
+
+        state.validation_rounds.append(
+            {
+                "round": max_rounds,
+                "action": "stop",
+                "reason": "validation round cap reached",
+                "average_confidence": float((state.evidence_quorum or {}).get("average_confidence") or 0.0),
+            }
+        )
 
     def _research_manager(self, state: NepseAgentState) -> ResearchPlan:
         c = state.candidate

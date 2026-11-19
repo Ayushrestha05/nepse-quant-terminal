@@ -56,16 +56,16 @@ def _query_sentiment_scores(
     Returns:
         DataFrame with columns: date, symbol, source, model, score, confidence, n_documents
     """
-    start_date = (
-        datetime.strptime(end_date, "%Y-%m-%d") - timedelta(days=lookback_days)
-    ).strftime("%Y-%m-%d")
+    # No look-ahead: only scores with published date strictly before trade date.
+    trade_day = datetime.strptime(end_date, "%Y-%m-%d")
+    start_date = (trade_day - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
 
     conn = sqlite3.connect(db_path)
 
     query = """
         SELECT date, symbol, source, model, score, confidence, n_documents
         FROM sentiment_scores
-        WHERE date >= ? AND date <= ?
+        WHERE date >= ? AND date < ?
     """
     params = [start_date, end_date]
 
