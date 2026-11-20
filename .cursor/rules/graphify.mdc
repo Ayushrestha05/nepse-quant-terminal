@@ -1,23 +1,32 @@
 ---
-description: graphify knowledge graph context + conflict recreate policy
+description: ALWAYS search graphify + nqt-vault first for project info, keep post-commit hook active, and never commit graphify-out
 alwaysApply: true
 ---
 
-# Graphify
+# Graphify + nqt-vault Search First
 
-This project has a local graphify knowledge graph at `graphify-out/` (gitignored).
+This project maintains two complementary knowledge stores:
+- **Code graph:** `graphify-out/` (gitignored, auto-rebuilt after every commit via `.git/hooks/post-commit`)
+- **Product & decision vault:** `nqt-vault/` (Obsidian markdown with `[[wikilinks]]`, tracked in git)
 
-## Before exploring code
+## Mandatory lookup order (before blind code search)
 
-Prefer graphify over blind Read/Grep/Glob for architecture questions:
+For **any** question about the project — architecture, symbol/call relationships, components, history, backtests, data sources, or decisions — search **both** sources before falling back to broad `Grep`/`Glob` across the codebase:
 
-- `graphify query "<question>"`
-- `graphify path "<A>" "<B>"`
-- `graphify explain "<concept>"`
+1. **Graphify (code structure & call paths):**
+   - `graphify query "<question>"`
+   - `graphify path "<A>" "<B>"`
+   - `graphify explain "<concept>"`
+2. **nqt-vault (intent, ADRs, history, reports, data sources):**
+   - Search `nqt-vault/` (`Grep` on `nqt-vault/`, `obsidian vault=nqt-vault search query="..."`, or read `nqt-vault/00 - Index.md`, `Project History/Change Log.md`, `Project History/Decision Log.md`, `Backtest Reports/Backtest Reports.md`).
 
-Skip only when (1) graphify already oriented you and you need exact lines to edit, or (2) `graphify-out/graph.json` is missing — then run `./scripts/ops/recreate_graphify.sh` (or `graphify extract . --code-only`).
+Skip only when (1) Graphify + `nqt-vault/` already oriented you and you need exact lines to edit, or (2) `graphify-out/graph.json` is missing — then rebuild with `./scripts/ops/recreate_graphify.sh` (or `graphify update .`).
 
-After meaningful code edits: `graphify update .`.
+## Keep graph fresh (post-commit hook)
+
+- `graphify hook install` installs `.git/hooks/post-commit` (plus checkout/merge/rewrite) so `graphify` auto-rebuilds in the background after every `git commit` (log: `~/.cache/graphify-rebuild.log`).
+- On a fresh clone or if `graphify hook status` reports missing hooks, run `graphify hook install`.
+- After large uncommitted edits where you need fresh graph answers immediately, run `graphify update .`.
 
 ## Git / PR / merge conflicts
 

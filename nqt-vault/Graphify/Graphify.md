@@ -28,9 +28,18 @@ graphify-out/
 └── GRAPH_REPORT.md
 ```
 
+## Auto-rebuild on every commit
+
+```bash
+graphify hook install   # installs post-commit, post-checkout, post-merge, post-rewrite
+graphify hook status    # verify hooks are active
+```
+
+Runs detached after each `git commit` (log: `~/.cache/graphify-rebuild.log`). Re-run `graphify hook install` on fresh clones.
+
 ## Agent usage
 
-- Cursor rule: `.cursor/rules/graphify.mdc` (always apply) — query before blind grep.
+- Cursor rules: `.cursor/rules/graphify.mdc` + `.cursor/rules/nqt-vault.mdc` (`alwaysApply`) — search **both** Graphify and `nqt-vault/` before blind code search.
 - Skills: `.cursor/skills/graphify/SKILL.md`, `.agents/skills/graphify/SKILL.md`.
 - Conflict policy: [[Graphify Git Policy]] — delete artifacts, recreate.
 

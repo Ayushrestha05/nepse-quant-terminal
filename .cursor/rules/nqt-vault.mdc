@@ -16,7 +16,11 @@ Vault: `nqt-vault/` at repo root. Follow `.cursor/skills/nqt-vault/SKILL.md`.
 3. Link new components from `nqt-vault/00 - Index.md` when you add a note.
 4. Irreversible choice → new ADR in `Decision Log.md` (never edit an accepted ADR; supersede).
 5. Optional session note: `Project History/YYYY-MM-DD - Title.md`.
-6. **Commit completed work** with a conventional commit message once verified (stage only intended files; never stage `nqt-vault/.obsidian/workspace.json`, runtime data, or secrets; do not push unless asked).
+6. **Commit completed work** with a conventional commit message once verified (stage only intended files; never stage `nqt-vault/.obsidian/*`, `graphify-out/`, runtime data, or secrets; do not push unless asked). The `post-commit` hook auto-rebuilds `graphify-out/` after each commit.
+
+## Lookup
+
+When answering questions about the project, search `nqt-vault/` alongside `graphify` first (see `.cursor/rules/graphify.mdc`).
 
 ## Do not
 
