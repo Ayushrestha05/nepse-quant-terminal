@@ -1,11 +1,12 @@
 ---
-title: 2026-11-20 - NEPSE Book-Closure Run-Up
+title: NEPSE Book-Closure Run-Up (2026-11-20 11:08)
 tags: [backtest, report, strategy]
 status: active
 date: 2026-11-20
+run_stamp: 2026-11-20_1108
 ---
 
-# NEPSE Book-Closure Run-Up (2026-11-20)
+# NEPSE Book-Closure Run-Up (2026-11-20 11:08)
 
 - **Strategy ID:** `nepse_book_closure_runup`
 - **Signals:** `book_closure_runup`
@@ -29,4 +30,4 @@ date: 2026-11-20
 | `lump_1l` | +4.56% | 0.61 | -13.13% | 66 | +1.72% | 0.45 | -2.61% | 17 |
 | `sip_5k` | +4.49% | 0.64 | -10.36% | 65 | +1.66% | 0.54 | -2.08% | 17 |
 
-Related: [[2026-11-20 - Strategy Comparison]], [[Backtest Reports]], [[Strategy Catalog]], [[Backtesting Process]].
+Related: [[2026-11-20_1108/Strategy Comparison|Strategy Comparison]], [[Backtest Reports]], [[Strategy Catalog]], [[Backtesting Process]].

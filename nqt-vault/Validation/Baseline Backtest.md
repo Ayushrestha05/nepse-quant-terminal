@@ -31,7 +31,7 @@ Cross-check cache: `data/runtime/crosscheck/`.
 
 ## Metrics (`2020-01-01` → `2026-11-19`)
 
-### NAV-based sizing across all 3 standard scenarios (ADR-003, [[2026-11-20 - C5 Baseline (NAV Sizing)]])
+### NAV-based sizing across all 3 standard scenarios (ADR-003, [[2026-11-20_1108/C5 Baseline (NAV Sizing)|C5 Baseline (NAV Sizing)]])
 
 | Scenario | Contributed | Final NAV | TWR CAGR | XIRR | Sharpe | Max DD | Trades | Fees % Inv | OOS CAGR (25-26) | OOS Sharpe |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |

@@ -1,11 +1,12 @@
 ---
-title: 2026-11-20 - C5 Baseline (NAV Sizing)
+title: C5 Baseline (NAV Sizing) (2026-11-20 11:08)
 tags: [backtest, report, strategy]
 status: active
 date: 2026-11-20
+run_stamp: 2026-11-20_1108
 ---
 
-# C5 Baseline (2026-11-20)
+# C5 Baseline (2026-11-20 11:08)
 
 - **Strategy ID:** `default_c5`
 - **Signals:** `volume, quality, low_vol, mean_reversion, quarterly_fundamental, xsec_momentum`
@@ -29,4 +30,4 @@ date: 2026-11-20
 | `lump_1l` | +7.19% | 0.46 | -54.54% | 130 | +12.12% | 0.88 | -20.69% | 41 |
 | `sip_5k` | +1.70% | 0.19 | -53.58% | 120 | +15.11% | 1.22 | -14.64% | 45 |
 
-Related: [[2026-11-20 - Strategy Comparison]], [[Backtest Reports]], [[Strategy Catalog]], [[Backtesting Process]].
+Related: [[2026-11-20_1108/Strategy Comparison|Strategy Comparison]], [[Backtest Reports]], [[Strategy Catalog]], [[Backtesting Process]].

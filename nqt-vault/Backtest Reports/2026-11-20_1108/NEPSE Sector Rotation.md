@@ -1,11 +1,12 @@
 ---
-title: 2026-11-20 - NEPSE Sector Rotation
+title: NEPSE Sector Rotation (2026-11-20 11:08)
 tags: [backtest, report, strategy]
 status: active
 date: 2026-11-20
+run_stamp: 2026-11-20_1108
 ---
 
-# NEPSE Sector Rotation (2026-11-20)
+# NEPSE Sector Rotation (2026-11-20 11:08)
 
 - **Strategy ID:** `nepse_sector_rotation`
 - **Signals:** `sector_rotation`
@@ -29,4 +30,4 @@ date: 2026-11-20
 | `lump_1l` | +21.04% | 0.92 | -35.45% | 175 | -13.14% | -0.60 | -35.35% | 57 |
 | `sip_5k` | +20.86% | 0.88 | -36.92% | 162 | -14.77% | -0.78 | -34.95% | 60 |
 
-Related: [[2026-11-20 - Strategy Comparison]], [[Backtest Reports]], [[Strategy Catalog]], [[Backtesting Process]].
+Related: [[2026-11-20_1108/Strategy Comparison|Strategy Comparison]], [[Backtest Reports]], [[Strategy Catalog]], [[Backtesting Process]].

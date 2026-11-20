@@ -1,11 +1,12 @@
 ---
-title: 2026-11-20 - NEPSE Ex-Date Gap Rebound
+title: NEPSE Ex-Date Gap Rebound (2026-11-20 11:08)
 tags: [backtest, report, strategy]
 status: active
 date: 2026-11-20
+run_stamp: 2026-11-20_1108
 ---
 
-# NEPSE Ex-Date Gap Rebound (2026-11-20)
+# NEPSE Ex-Date Gap Rebound (2026-11-20 11:08)
 
 - **Strategy ID:** `nepse_ex_date_gap`
 - **Signals:** `ex_date_gap`
@@ -29,4 +30,4 @@ date: 2026-11-20
 | `lump_1l` | -4.07% | -0.48 | -38.40% | 32 | +2.52% | 0.40 | -8.33% | 12 |
 | `sip_5k` | -4.21% | -0.64 | -35.18% | 31 | +1.61% | 0.40 | -4.98% | 13 |
 
-Related: [[2026-11-20 - Strategy Comparison]], [[Backtest Reports]], [[Strategy Catalog]], [[Backtesting Process]].
+Related: [[2026-11-20_1108/Strategy Comparison|Strategy Comparison]], [[Backtest Reports]], [[Strategy Catalog]], [[Backtesting Process]].

@@ -316,7 +316,6 @@ def _safe_filename(name: str) -> str:
 
 def _generate_charts(
     runs_by_scenario: Dict[str, List[Dict[str, Any]]],
-    run_date: str,
     charts_dir: Path,
 ) -> Dict[str, Path]:
     charts_dir.mkdir(parents=True, exist_ok=True)
@@ -368,7 +367,7 @@ def _generate_charts(
         ax.legend(loc="upper left", fontsize=8.5, framealpha=0.9)
         fig.tight_layout()
 
-        out_png = charts_dir / f"{run_date} - nav_{scenario_key}.png"
+        out_png = charts_dir / f"nav_{scenario_key}.png"
         fig.savefig(out_png, dpi=140)
         plt.close(fig)
         chart_paths[scenario_key] = out_png
@@ -380,12 +379,17 @@ def generate_vault_reports(
     *,
     all_strategy_ids: List[str],
     data_end: str,
-    run_date: str,
+    run_stamp: str,
     start_date: str,
 ) -> Tuple[List[Path], Path]:
-    reports_dir = ROOT / "nqt-vault" / "Backtest Reports"
-    charts_dir = reports_dir / "charts"
-    reports_dir.mkdir(parents=True, exist_ok=True)
+    reports_root = ROOT / "nqt-vault" / "Backtest Reports"
+    run_dir = reports_root / run_stamp
+    charts_dir = run_dir / "charts"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    run_date = run_stamp[:10]
+    run_display = run_stamp.replace("_", " ")
+    if len(run_stamp) == 15 and run_stamp[10] == "_":
+        run_display = f"{run_stamp[:10]} {run_stamp[11:13]}:{run_stamp[13:15]}"
 
     runs = load_latest_runs(data_end=data_end, strategy_ids=all_strategy_ids)
     by_strat: Dict[str, Dict[str, Dict[str, Any]]] = {}
@@ -409,18 +413,19 @@ def generate_vault_reports(
             continue
 
         note_label = "C5 Baseline (NAV Sizing)" if sid == "default_c5" else _safe_filename(name)
-        note_stem = f"{run_date} - {note_label}"
-        note_path = reports_dir / f"{note_stem}.md"
+        note_path = run_dir / f"{note_label}.md"
+        note_wikilink = f"[[{run_stamp}/{note_label}|{note_label}]]"
 
         lines = [
             "---",
-            f"title: {note_stem}",
+            f"title: {note_label} ({run_display})",
             "tags: [backtest, report, strategy]",
             "status: active",
             f"date: {run_date}",
+            f"run_stamp: {run_stamp}",
             "---",
             "",
-            f"# {name} ({run_date})",
+            f"# {name} ({run_display})",
             "",
             f"- **Strategy ID:** `{sid}`",
             f"- **Signals:** `{sigs}`",
@@ -449,7 +454,7 @@ def generate_vault_reports(
                 f"{_fmt_pct(oos['twr_cagr_pct'])} | {oos['sharpe']:.2f} |"
             )
             tracker_rows.append(
-                f"| {run_date} | [[{note_stem}]] | `{sid}` | `{sc_key}` | "
+                f"| {run_display} | {note_wikilink} | `{sid}` | `{sc_key}` | "
                 f"`{start_date}` → `{data_end}` | complete | {_fmt_pct(m['twr_total_return_pct'])} | "
                 f"{_fmt_pct(m['twr_cagr_pct'])} | {_fmt_pct(m['xirr_pct'])} | {m['sharpe']:.2f} | "
                 f"{_fmt_pct(m['max_drawdown_pct'])} | {m['trades']} |"
@@ -480,32 +485,34 @@ def generate_vault_reports(
         lines.extend(
             [
                 "",
-                f"Related: [[{run_date} - Strategy Comparison]], [[Backtest Reports]], [[Strategy Catalog]], [[Backtesting Process]].",
+                f"Related: [[{run_stamp}/Strategy Comparison|Strategy Comparison]], [[Backtest Reports]], [[Strategy Catalog]], [[Backtesting Process]].",
                 "",
             ]
         )
         note_path.write_text("\n".join(lines), encoding="utf-8")
         per_run_paths.append(note_path)
 
-    # Generate comparison charts
-    chart_paths = _generate_charts(by_scenario, run_date, charts_dir)
+    # Generate comparison charts inside the timestamped run folder
+    chart_paths = _generate_charts(by_scenario, charts_dir)
 
-    # Build Strategy Comparison report
-    comp_stem = f"{run_date} - Strategy Comparison"
-    comp_path = reports_dir / f"{comp_stem}.md"
+    # Build Strategy Comparison report inside the timestamped run folder
+    comp_path = run_dir / "Strategy Comparison.md"
+    comp_wikilink = f"[[{run_stamp}/Strategy Comparison|{run_display} — Strategy Comparison]]"
 
     c5_by_scen = by_strat.get("default_c5", {})
 
     comp_lines = [
         "---",
-        f"title: {comp_stem}",
+        f"title: Strategy Comparison ({run_display})",
         "tags: [backtest, comparison, strategies, report]",
         "status: active",
         f"date: {run_date}",
+        f"run_stamp: {run_stamp}",
         "---",
         "",
-        f"# NEPSE Strategy Comparison ({run_date})",
+        f"# NEPSE Strategy Comparison ({run_display})",
         "",
+        f"- **Run folder:** `nqt-vault/Backtest Reports/{run_stamp}/`",
         f"- **Window:** `{start_date}` → `{data_end}`",
         "- **Selection discipline:** Combination strategies (`combo_top3_sharpe`, `combo_top5_sharpe`, `combo_c5_plus_best`) were selected strictly from `2020-01-01..2024-12-31` solo Sharpe ratios. `2025-01-01` onward is reported separately as Out-of-Sample (OOS).",
         "- **Engine rules:** Equal-weight sizing from current account NAV (cash + MTM holdings), no NPR 10K floor, 10-share minimum lot preserved, small-account position caps, realistic NEPSE fees including NPR 25 DP charge.",
@@ -592,7 +599,7 @@ def generate_vault_reports(
             strat = load_strategy(sid)
             name = strat["name"] if strat else sid
             note_label = "C5 Baseline (NAV Sizing)" if sid == "default_c5" else _safe_filename(name)
-            note_link = f"[[{run_date} - {note_label}|{name}]]"
+            note_link = f"[[{run_stamp}/{note_label}|{name}]]"
             if sid == "default_c5":
                 note_link = f"**{note_link}**"
             m = r["metrics"]
@@ -614,8 +621,18 @@ def generate_vault_reports(
     )
     comp_path.write_text("\n".join(comp_lines), encoding="utf-8")
 
-    # Update Run Tracker in Backtest Reports.md (add Scenario + XIRR columns while preserving historical rows)
-    index_path = reports_dir / "Backtest Reports.md"
+    # Discover all timestamped suite folders (newest first) for the top-level MOC
+    suite_folders = sorted(
+        [p.name for p in reports_root.iterdir() if p.is_dir() and (p / "Strategy Comparison.md").exists()],
+        reverse=True,
+    )
+    suite_list_lines = [
+        f"- [[{folder}/Strategy Comparison|{folder.replace('_', ' ')} — Strategy Comparison]] (`{folder}/`)"
+        for folder in suite_folders
+    ]
+
+    # Update Backtest Reports.md MOC
+    index_path = reports_root / "Backtest Reports.md"
     index_lines = [
         "---",
         "title: Backtest Reports",
@@ -625,21 +642,25 @@ def generate_vault_reports(
         "",
         "# Backtest Reports",
         "",
-        "Dated paper-backtest run logs for comparing strategy versions, capital scenarios, data snapshots, and parameter changes over time.",
+        "Dated paper-backtest run logs grouped by run timestamp (`YYYY-MM-DD_HHMM/`) so reports and charts stay tidy.",
         "",
-        "- **Naming:** `YYYY-MM-DD - <Strategy> <Label>.md`",
+        "- **Folder layout:** `nqt-vault/Backtest Reports/YYYY-MM-DD_HHMM/` (`Strategy Comparison.md`, `<Strategy>.md`, `charts/nav_<scenario>.png`)",
         "- **Standard scenarios:** Every backtest runs all 3 `CAPITAL_SCENARIOS` (`lump_10l`, `lump_1l`, `sip_5k`).",
         "- **Trade store (gitignored):** `data/backtests.db` (`runs`, `trades`, `daily_nav`, `contributions`)",
-        "- **Comparison report:** [[" + comp_stem + "]]",
+        f"- **Latest comparison report:** {comp_wikilink}",
         "- **Methodology & reproduction:** [[Baseline Backtest]] · [[Backtesting Process]] · [[Strategy Catalog]] · [[External Market Data Sources]] · [[Validation Suite]]",
         "",
-        "## Run Tracker",
+        "## Suite Runs (Newest First)",
         "",
-        "| Date | Report | Strategy | Scenario | Window | Status | TWR Total | TWR CAGR | XIRR | Sharpe | Max DD | Trades |",
+        *suite_list_lines,
+        "",
+        f"## Latest Run Tracker (`{run_display}`)",
+        "",
+        "| Run | Report | Strategy | Scenario | Window | Status | TWR Total | TWR CAGR | XIRR | Sharpe | Max DD | Trades |",
         "| --- | --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |",
         *tracker_rows,
-        "| 2026-11-20 | [[2026-11-20 - C5 Baseline]] | `default_c5` | `lump_10l` *(legacy fixed-cap sizing)* | `2020-01-01` → `2026-11-19` | complete | +121.09% | +12.21% | — | 1.07 | -26.14% | 209 |",
-        "| 2026-11-20 | [[2026-11-20 - C5 Baseline (Partial)]] | `default_c5` | `lump_10l` *(legacy)* | `2020-01-01` → `2025-02-10` | partial | +109.45% | +15.56% | — | — | -22.07%* | 160 |",
+        "| 2026-11-20 (legacy) | [[2026-11-20 - C5 Baseline]] | `default_c5` | `lump_10l` *(fixed-cap sizing)* | `2020-01-01` → `2026-11-19` | complete | +121.09% | +12.21% | — | 1.07 | -26.14% | 209 |",
+        "| 2026-11-20 (legacy) | [[2026-11-20 - C5 Baseline (Partial)]] | `default_c5` | `lump_10l` *(fixed-cap)* | `2020-01-01` → `2025-02-10` | partial | +109.45% | +15.56% | — | — | -22.07%* | 160 |",
         "",
         "\\*Checkpoint floor from 50-day log intervals; true daily drawdown is at least this magnitude.",
         "",
@@ -658,13 +679,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--workers", type=int, default=max(1, min(6, (os.cpu_count() or 2) - 1)))
     parser.add_argument("--force", action="store_true", help="Re-run even if matching run exists in data/backtests.db")
     parser.add_argument("--reports-only", action="store_true", help="Skip backtests and regenerate vault reports from DB")
+    parser.add_argument("--run-stamp", default=None, help="Folder timestamp YYYY-MM-DD_HHMM (default: current local time)")
     args = parser.parse_args(argv)
 
     data_end = _db_max_date()
     end_date = args.end or data_end
-    run_date = date.today().isoformat()
+    run_stamp = args.run_stamp or datetime.now().strftime("%Y-%m-%d_%H%M")
 
-    print(f"NEPSE Strategy Suite | window {args.start} -> {end_date} | data_end={data_end} | workers={args.workers}")
+    print(f"NEPSE Strategy Suite | window {args.start} -> {end_date} | data_end={data_end} | workers={args.workers} | folder={run_stamp}")
 
     if not args.reports_only:
         print("\n=== Phase 1: 9 Solo Strategies x 3 Capital Scenarios (27 runs) ===")
@@ -682,7 +704,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     per_run_paths, comp_path = generate_vault_reports(
         all_strategy_ids=all_ids,
         data_end=data_end,
-        run_date=run_date,
+        run_stamp=run_stamp,
         start_date=args.start,
     )
     print(f"Wrote {len(per_run_paths)} per-strategy reports and comparison report: {comp_path}")

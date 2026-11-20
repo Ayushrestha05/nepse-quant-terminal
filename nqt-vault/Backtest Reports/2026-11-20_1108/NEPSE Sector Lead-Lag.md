@@ -1,11 +1,12 @@
 ---
-title: 2026-11-20 - NEPSE Sector Lead-Lag
+title: NEPSE Sector Lead-Lag (2026-11-20 11:08)
 tags: [backtest, report, strategy]
 status: active
 date: 2026-11-20
+run_stamp: 2026-11-20_1108
 ---
 
-# NEPSE Sector Lead-Lag (2026-11-20)
+# NEPSE Sector Lead-Lag (2026-11-20 11:08)
 
 - **Strategy ID:** `nepse_lead_lag`
 - **Signals:** `lead_lag`
@@ -29,4 +30,4 @@ date: 2026-11-20
 | `lump_1l` | +18.67% | 1.01 | -40.23% | 156 | -5.84% | -0.39 | -27.54% | 61 |
 | `sip_5k` | +14.26% | 0.81 | -40.27% | 144 | -10.17% | -0.82 | -29.91% | 69 |
 
-Related: [[2026-11-20 - Strategy Comparison]], [[Backtest Reports]], [[Strategy Catalog]], [[Backtesting Process]].
+Related: [[2026-11-20_1108/Strategy Comparison|Strategy Comparison]], [[Backtest Reports]], [[Strategy Catalog]], [[Backtesting Process]].

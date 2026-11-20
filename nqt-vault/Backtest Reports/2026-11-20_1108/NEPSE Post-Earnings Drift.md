@@ -1,11 +1,12 @@
 ---
-title: 2026-11-20 - NEPSE Post-Earnings Drift
+title: NEPSE Post-Earnings Drift (2026-11-20 11:08)
 tags: [backtest, report, strategy]
 status: active
 date: 2026-11-20
+run_stamp: 2026-11-20_1108
 ---
 
-# NEPSE Post-Earnings Drift (2026-11-20)
+# NEPSE Post-Earnings Drift (2026-11-20 11:08)
 
 - **Strategy ID:** `nepse_earnings_drift`
 - **Signals:** `earnings_drift`
@@ -29,4 +30,4 @@ date: 2026-11-20
 | `lump_1l` | -3.59% | -0.09 | -59.47% | 84 | -11.69% | -1.08 | -31.61% | 20 |
 | `sip_5k` | -4.14% | -0.08 | -58.63% | 88 | -5.93% | -0.54 | -17.95% | 27 |
 
-Related: [[2026-11-20 - Strategy Comparison]], [[Backtest Reports]], [[Strategy Catalog]], [[Backtesting Process]].
+Related: [[2026-11-20_1108/Strategy Comparison|Strategy Comparison]], [[Backtest Reports]], [[Strategy Catalog]], [[Backtesting Process]].

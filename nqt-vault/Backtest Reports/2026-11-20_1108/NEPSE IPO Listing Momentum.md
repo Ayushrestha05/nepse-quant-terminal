@@ -1,11 +1,12 @@
 ---
-title: 2026-11-20 - NEPSE IPO Listing Momentum
+title: NEPSE IPO Listing Momentum (2026-11-20 11:08)
 tags: [backtest, report, strategy]
 status: active
 date: 2026-11-20
+run_stamp: 2026-11-20_1108
 ---
 
-# NEPSE IPO Listing Momentum (2026-11-20)
+# NEPSE IPO Listing Momentum (2026-11-20 11:08)
 
 - **Strategy ID:** `nepse_ipo_momentum`
 - **Signals:** `ipo_momentum`
@@ -29,4 +30,4 @@ date: 2026-11-20
 | `lump_1l` | +73.64% | 2.65 | -20.43% | 147 | +332.25% | 4.22 | -21.87% | 52 |
 | `sip_5k` | +73.56% | 2.50 | -20.42% | 143 | +332.24% | 4.22 | -21.87% | 52 |
 
-Related: [[2026-11-20 - Strategy Comparison]], [[Backtest Reports]], [[Strategy Catalog]], [[Backtesting Process]].
+Related: [[2026-11-20_1108/Strategy Comparison|Strategy Comparison]], [[Backtest Reports]], [[Strategy Catalog]], [[Backtesting Process]].

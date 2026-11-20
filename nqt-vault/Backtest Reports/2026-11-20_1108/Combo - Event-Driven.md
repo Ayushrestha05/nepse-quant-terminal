@@ -1,11 +1,12 @@
 ---
-title: 2026-11-20 - Combo - Event-Driven
+title: Combo - Event-Driven (2026-11-20 11:08)
 tags: [backtest, report, strategy]
 status: active
 date: 2026-11-20
+run_stamp: 2026-11-20_1108
 ---
 
-# Combo: Event-Driven (2026-11-20)
+# Combo: Event-Driven (2026-11-20 11:08)
 
 - **Strategy ID:** `combo_event_driven`
 - **Signals:** `book_closure_runup, ex_date_gap, earnings_drift`
@@ -29,4 +30,4 @@ date: 2026-11-20
 | `lump_1l` | -1.50% | 0.03 | -64.95% | 153 | -16.36% | -1.43 | -36.99% | 41 |
 | `sip_5k` | -2.92% | -0.07 | -62.85% | 152 | -9.62% | -1.16 | -25.09% | 45 |
 
-Related: [[2026-11-20 - Strategy Comparison]], [[Backtest Reports]], [[Strategy Catalog]], [[Backtesting Process]].
+Related: [[2026-11-20_1108/Strategy Comparison|Strategy Comparison]], [[Backtest Reports]], [[Strategy Catalog]], [[Backtesting Process]].

@@ -1,11 +1,12 @@
 ---
-title: 2026-11-20 - Combo - C5 Plus Best New (ipo_momentum)
+title: Combo - C5 Plus Best New (ipo_momentum) (2026-11-20 11:08)
 tags: [backtest, report, strategy]
 status: active
 date: 2026-11-20
+run_stamp: 2026-11-20_1108
 ---
 
-# Combo: C5 + Best New (ipo_momentum) (2026-11-20)
+# Combo: C5 + Best New (ipo_momentum) (2026-11-20 11:08)
 
 - **Strategy ID:** `combo_c5_plus_best`
 - **Signals:** `volume, quality, low_vol, mean_reversion, quarterly_fundamental, xsec_momentum, ipo_momentum`
@@ -29,4 +30,4 @@ date: 2026-11-20
 | `lump_1l` | +36.28% | 1.46 | -40.38% | 172 | +133.26% | 3.32 | -24.55% | 60 |
 | `sip_5k` | +28.12% | 1.18 | -38.61% | 151 | +133.20% | 3.32 | -24.46% | 60 |
 
-Related: [[2026-11-20 - Strategy Comparison]], [[Backtest Reports]], [[Strategy Catalog]], [[Backtesting Process]].
+Related: [[2026-11-20_1108/Strategy Comparison|Strategy Comparison]], [[Backtest Reports]], [[Strategy Catalog]], [[Backtesting Process]].

@@ -1,11 +1,12 @@
 ---
-title: 2026-11-20 - Combo - Trend & Breakout
+title: Combo - Trend & Breakout (2026-11-20 11:08)
 tags: [backtest, report, strategy]
 status: active
 date: 2026-11-20
+run_stamp: 2026-11-20_1108
 ---
 
-# Combo: Trend & Breakout (2026-11-20)
+# Combo: Trend & Breakout (2026-11-20 11:08)
 
 - **Strategy ID:** `combo_trend`
 - **Signals:** `circuit_continuation, ipo_momentum, sector_rotation`
@@ -29,4 +30,4 @@ date: 2026-11-20
 | `lump_1l` | +46.70% | 1.42 | -40.60% | 284 | +36.06% | 1.17 | -44.04% | 109 |
 | `sip_5k` | +48.09% | 1.42 | -40.50% | 262 | +36.10% | 1.17 | -44.03% | 109 |
 
-Related: [[2026-11-20 - Strategy Comparison]], [[Backtest Reports]], [[Strategy Catalog]], [[Backtesting Process]].
+Related: [[2026-11-20_1108/Strategy Comparison|Strategy Comparison]], [[Backtest Reports]], [[Strategy Catalog]], [[Backtesting Process]].

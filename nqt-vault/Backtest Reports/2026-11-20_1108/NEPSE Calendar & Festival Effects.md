@@ -1,11 +1,12 @@
 ---
-title: 2026-11-20 - NEPSE Calendar & Festival Effects
+title: NEPSE Calendar & Festival Effects (2026-11-20 11:08)
 tags: [backtest, report, strategy]
 status: active
 date: 2026-11-20
+run_stamp: 2026-11-20_1108
 ---
 
-# NEPSE Calendar & Festival Effects (2026-11-20)
+# NEPSE Calendar & Festival Effects (2026-11-20 11:08)
 
 - **Strategy ID:** `nepse_calendar_festival`
 - **Signals:** `calendar_festival`
@@ -29,4 +30,4 @@ date: 2026-11-20
 | `lump_1l` | +6.74% | 0.57 | -24.84% | 49 | -0.98% | -0.06 | -12.57% | 16 |
 | `sip_5k` | +5.35% | 0.46 | -24.56% | 47 | -0.75% | -0.07 | -10.42% | 17 |
 
-Related: [[2026-11-20 - Strategy Comparison]], [[Backtest Reports]], [[Strategy Catalog]], [[Backtesting Process]].
+Related: [[2026-11-20_1108/Strategy Comparison|Strategy Comparison]], [[Backtest Reports]], [[Strategy Catalog]], [[Backtesting Process]].

@@ -20,3 +20,4 @@ Every backtest run in this repository must evaluate all three standard capital s
 3. **Report both TWR and XIRR:** Always report time-weighted return (`twr_total_return`, `twr_annualized_return`, Sharpe, Max DD from TWR) alongside money-weighted `xirr` and `total_contributed` vs `final_nav`.
 4. **No lookahead / split discipline:** Any combination or parameter selection must use only the in-sample window (`2020-01-01..2024-12-31`) and report `2025-01-01+` separately as out-of-sample.
 5. **Keep realistic NEPSE sizing & fees:** Size positions from current account NAV with `effective_max_positions_for_nav`, enforce the 10-share minimum lot (no arbitrary NPR 10K floor), and keep full NEPSE fees including the NPR 25 DP charge.
+6. **Group vault reports by run timestamp:** Write each run's markdown reports and charts into `nqt-vault/Backtest Reports/YYYY-MM-DD_HHMM/` (never dump flat files at the root of `Backtest Reports/`), and link them from `Backtest Reports.md`.

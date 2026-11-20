@@ -54,7 +54,7 @@ Every backtest runs all three `CAPITAL_SCENARIOS` (enforced by `.cursor/rules/ba
 - `trades.csv` — closed trade ledger (`symbol`, `signal_date`, `entry_date`, `exit_date`, fees, net P&L)
 - `nav.csv` — daily mark-to-market NAV curve
 
-Durable run summaries belong in [[Backtest Reports]] (`nqt-vault/Backtest Reports/YYYY-MM-DD - <Strategy> <Label>.md`).
+Durable run summaries belong in [[Backtest Reports]], grouped by date and time under `nqt-vault/Backtest Reports/YYYY-MM-DD_HHMM/` (`Strategy Comparison.md`, `<Strategy>.md`, `charts/nav_<scenario>.png`).
 
 ## Execution pipeline
 

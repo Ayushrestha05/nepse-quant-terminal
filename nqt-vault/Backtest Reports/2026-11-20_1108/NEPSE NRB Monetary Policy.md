@@ -1,11 +1,12 @@
 ---
-title: 2026-11-20 - NEPSE NRB Monetary Policy
+title: NEPSE NRB Monetary Policy (2026-11-20 11:08)
 tags: [backtest, report, strategy]
 status: active
 date: 2026-11-20
+run_stamp: 2026-11-20_1108
 ---
 
-# NEPSE NRB Monetary Policy (2026-11-20)
+# NEPSE NRB Monetary Policy (2026-11-20 11:08)
 
 - **Strategy ID:** `nepse_nrb_policy`
 - **Signals:** `nrb_policy`
@@ -29,4 +30,4 @@ date: 2026-11-20
 | `lump_1l` | -7.56% | -1.04 | -32.51% | 17 | -2.30% | -0.23 | -19.52% | 6 |
 | `sip_5k` | -7.03% | -1.03 | -31.07% | 18 | -3.03% | -0.49 | -15.29% | 8 |
 
-Related: [[2026-11-20 - Strategy Comparison]], [[Backtest Reports]], [[Strategy Catalog]], [[Backtesting Process]].
+Related: [[2026-11-20_1108/Strategy Comparison|Strategy Comparison]], [[Backtest Reports]], [[Strategy Catalog]], [[Backtesting Process]].

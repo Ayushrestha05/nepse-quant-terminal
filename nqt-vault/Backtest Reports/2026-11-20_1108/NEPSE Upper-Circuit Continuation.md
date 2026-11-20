@@ -1,11 +1,12 @@
 ---
-title: 2026-11-20 - NEPSE Upper-Circuit Continuation
+title: NEPSE Upper-Circuit Continuation (2026-11-20 11:08)
 tags: [backtest, report, strategy]
 status: active
 date: 2026-11-20
+run_stamp: 2026-11-20_1108
 ---
 
-# NEPSE Upper-Circuit Continuation (2026-11-20)
+# NEPSE Upper-Circuit Continuation (2026-11-20 11:08)
 
 - **Strategy ID:** `nepse_circuit_continuation`
 - **Signals:** `circuit_continuation`
@@ -29,4 +30,4 @@ date: 2026-11-20
 | `lump_1l` | -0.41% | 0.12 | -46.14% | 240 | -56.33% | -2.76 | -81.30% | 86 |
 | `sip_5k` | -0.71% | 0.11 | -48.33% | 222 | -39.70% | -2.79 | -65.31% | 100 |
 
-Related: [[2026-11-20 - Strategy Comparison]], [[Backtest Reports]], [[Strategy Catalog]], [[Backtesting Process]].
+Related: [[2026-11-20_1108/Strategy Comparison|Strategy Comparison]], [[Backtest Reports]], [[Strategy Catalog]], [[Backtesting Process]].

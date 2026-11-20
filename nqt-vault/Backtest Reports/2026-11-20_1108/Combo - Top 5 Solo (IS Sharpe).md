@@ -1,11 +1,12 @@
 ---
-title: 2026-11-20 - Combo - Top 5 Solo (IS Sharpe)
+title: Combo - Top 5 Solo (IS Sharpe) (2026-11-20 11:08)
 tags: [backtest, report, strategy]
 status: active
 date: 2026-11-20
+run_stamp: 2026-11-20_1108
 ---
 
-# Combo: Top 5 Solo (IS Sharpe) (2026-11-20)
+# Combo: Top 5 Solo (IS Sharpe) (2026-11-20 11:08)
 
 - **Strategy ID:** `combo_top5_sharpe`
 - **Signals:** `ipo_momentum, lead_lag, sector_rotation, calendar_festival, book_closure_runup`
@@ -29,4 +30,4 @@ date: 2026-11-20
 | `lump_1l` | +46.74% | 1.52 | -40.06% | 253 | +75.26% | 2.40 | -22.89% | 80 |
 | `sip_5k` | +45.62% | 1.39 | -41.83% | 224 | +77.03% | 2.45 | -22.82% | 79 |
 
-Related: [[2026-11-20 - Strategy Comparison]], [[Backtest Reports]], [[Strategy Catalog]], [[Backtesting Process]].
+Related: [[2026-11-20_1108/Strategy Comparison|Strategy Comparison]], [[Backtest Reports]], [[Strategy Catalog]], [[Backtesting Process]].
