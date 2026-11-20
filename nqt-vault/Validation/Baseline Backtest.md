@@ -1,12 +1,12 @@
 ---
 title: Baseline Backtest
 tags: [validation, baseline, paper]
-status: partial
+status: complete
 ---
 
 # Baseline Backtest
 
-Paper simulation of the built-in **C5** strategy (`data/strategy_registry/builtin/default_c5.json`) vs NEPSE buy-and-hold.
+Paper simulation of the built-in **C5** strategy (`data/strategy_registry/builtin/default_c5.json`) vs NEPSE buy-and-hold. For the step-by-step execution pipeline see [[Backtesting Process]].
 
 ## How to reproduce
 
@@ -14,7 +14,7 @@ Paper simulation of the built-in **C5** strategy (`data/strategy_registry/builti
 # clean env if Cursor AppImage pollutes LD_LIBRARY_PATH — use project .venv
 .venv/bin/python setup_data.py
 .venv/bin/python setup_data.py --scrape --days 230   # top-up after bundled cutoff
-.venv/bin/python scripts/validation/run_baseline.py
+.venv/bin/python scripts/validation/run_baseline.py --force
 ```
 
 Outputs (gitignored): `data/runtime/baselines/<run_date>/` — `summary.txt`, `metrics.json`, `trades.csv`, `nav.csv`.
@@ -23,35 +23,34 @@ Cross-check cache: `data/runtime/crosscheck/`.
 
 ## Window and rules
 
-- **Target window:** `2020-01-01` → `2026-11-19` (1,557 trading days; 405 symbols; 504,616 price rows)
-- **Partial run reached:** `2020-01-01` → `2025-02-10` (day **1,150 / 1,557**, 73.9%; stopped early at ~4h15m before summary export)
+- **Window:** `2020-01-01` → `2026-11-19` (1,557 trading days; 405 symbols; 504,616 price rows)
+- **Runtime:** **4m 14s** (`254.46s` total after routing per-symbol lookups through `symbol_cache` and guarding `init_db()`; previously ~5.5–6h)
 - **Prices:** adjusted (Merolagani `isAdjust=1`)
 - **Exclude:** symbols where menaceXnadin overlap has >5% of days with close mismatch >1%
 - **Engine:** `run_backtest(..., exclude_symbols=…)` fees + stops + regime filter; **no slippage**
 
-## Partial Metrics (`2020-01-01` → `2025-02-10`, 5.11y)
+## Metrics (`2020-01-01` → `2026-11-19`, full run)
 
-Derived from 50-day NAV checkpoints in the run log (full trade-level stats require a completed run).
-
-| Metric | C5 (partial, 50-day checkpoints) | NEPSE buy-and-hold (same window) | NEPSE buy-and-hold (to `2026-04-15`) |
-| --- | --- | --- | --- |
-| Start → End NAV / Close | NPR 1,000,000 → 2,094,509 | 1,169.50 → 2,677.32 | 1,169.50 → 2,833.60 |
-| Total return | **+109.45%** | +128.93% | +142.29% |
-| Annualized (CAGR) | **+15.56%** | +17.59% | +15.12% |
-| Max drawdown | **-22.07%** *(checkpoint floor; true daily ≥ this)* | -43.25% | -43.25% |
-| Trades (to day 1,150) | **160** | — | — |
-| Sharpe / win rate / PF | Pending full completion | — | — |
+| Metric | C5 (`default_c5`) | NEPSE buy-and-hold (to `2026-04-15`) |
+| --- | ---: | ---: |
+| Start → End NAV / Close | NPR 1,000,000 → 2,210,873 | 1,169.50 → 2,833.60 |
+| Total return | **+121.09%** | +142.29% |
+| Annualized (CAGR) | **+12.21%** | +15.12% |
+| Volatility (ann.) | **12.07%** | — |
+| Sharpe / Sortino | **1.07** / **1.72** | — |
+| Max drawdown | **-26.14%** (875d) | -43.25% |
+| Trades / Win rate / PF | **209** / **38.8%** / **1.63** | — |
+| Fees paid | **NPR 360,959** | — |
 
 - **Excluded symbols (menaceXnadin cross-check, 21 symbols):** `0` (`none`).
 
-## Issues found during run
+## Issues tracked
 
-1. **NEPSE index stops at `2026-04-15`** (`stock_prices WHERE symbol='NEPSE'` max date = `2026-04-15`, while 352 stocks extend to `2026-11-19`). Must top up `NEPSE` before trusting regime-filter or benchmark numbers post-`2026-04-15`.
-2. **Runtime bottleneck:** ~11 min per 50 trading days (~5.5–6h for 1,557 days) in `simple_backtest.py` (single-threaded daily signal scan). Adding checkpoint/resume or optimizing per-day scan is needed before iterating on baselines.
+1. **NEPSE index stops at `2026-04-15`** *(open)*: `stock_prices WHERE symbol='NEPSE'` max date = `2026-04-15`, while 352 stocks extend to `2026-11-19`. Must top up `NEPSE` before trusting benchmark numbers post-`2026-04-15`.
+2. **Runtime bottleneck** *(resolved 2026-11-20)*: ~11 min per 50 trading days (~5.5–6h for 1,557 days) dropped to **~7.8s per 50 trading days (4m 14s total)** by routing every per-symbol lookup in `backend/backtesting/simple_backtest.py` through `symbol_cache` (`_history`) and calling `init_db()` once per DB path in `backend/quant_pro/event_layer.py`. Verified by `tests/test_backtest_parity.py` (76d Q1-2023 window: `489.45s` → `17.75s`, identical trades and NAV).
 
 ## Caveats
 
-- Partial run stopped at day 1,150/1,557; no `metrics.json` / `trades.csv` / `nav.csv` written yet.
 - In-sample relative to C5 parameter history (see README disclaimer).
 - No slippage; limit-locked days still fill.
 - Survivorship bias: delisted stocks missing from the universe.
@@ -59,7 +58,8 @@ Derived from 50-day NAV checkpoints in the run log (full trade-level stats requi
 
 ## Data sources & reports
 
+- Process guide: [[Backtesting Process]]
 - Data sources: [[External Market Data Sources]]
-- Run reports: [[Backtest Reports]] (latest: [[2026-11-20 - C5 Baseline (Partial)]])
+- Run reports: [[Backtest Reports]] (latest: [[2026-11-20 - C5 Baseline]], prior partial: [[2026-11-20 - C5 Baseline (Partial)]])
 
-Related: [[Validation Suite]], [[Signal Engine]], [[News Sentiment Pipeline]], [[Change Log]].
+Related: [[Backtesting Process]], [[Validation Suite]], [[Signal Engine]], [[News Sentiment Pipeline]], [[Change Log]].

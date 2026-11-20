@@ -54,6 +54,7 @@ Keyboard-driven research and **paper-trading** terminal for the Nepal Stock Exch
 ## Guides
 
 - [[Quick Start]]
+- [[Backtesting Process]] — end-to-end backtest flowchart, profiling, and run commands
 - [[Connect nepsequant.com]]
 - [[AI Setup]]
 - [[Developer Workflow]]

@@ -14,7 +14,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import requests
 
-from .database import get_db_connection, init_db
+from .database import get_db_connection, get_db_path, init_db
 from .data_scrapers.sentiment_ingestion import (
     scrape_merolagani_news,
     scrape_sharesansar_news,
@@ -918,12 +918,23 @@ def refresh_daily_event_layer(
     )
 
 
+_INITIALIZED_EVENT_DB_PATHS: set[str] = set()
+
+
+def _ensure_event_db_initialized() -> None:
+    db_path = get_db_path()
+    db_key = str(db_path.resolve())
+    if db_key not in _INITIALIZED_EVENT_DB_PATHS or not db_path.exists():
+        init_db()
+        _INITIALIZED_EVENT_DB_PATHS.add(db_key)
+
+
 def load_event_adjustment_context(
     as_of_date: date | datetime | str,
     *,
     min_confidence: Optional[float] = None,
 ) -> EventAdjustmentContext:
-    init_db()
+    _ensure_event_db_initialized()
     if isinstance(as_of_date, datetime):
         target_date = as_of_date.date().isoformat()
     elif isinstance(as_of_date, date):

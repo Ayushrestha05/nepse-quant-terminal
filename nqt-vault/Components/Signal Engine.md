@@ -17,4 +17,4 @@ tags: [component, signals, backtest]
 | `quarterly_fundamental` | EPS/revenue growth |
 | `satellite_hydro` | Rainfall / hydro |
 
-Add: implement `generate_*_at_date`, register in `SIGNAL_MAP`. Used by [[Tab Signals]], [[Validation Suite]], [[Strategy Registry]].
+Add: implement `generate_*_at_date` using `_history(..., symbol_cache=symbol_cache)` (never scan `prices_df` when `symbol_cache` is present), register in `SIGNAL_MAP`. Used by [[Tab Signals]], [[Backtesting Process]], [[Validation Suite]], [[Strategy Registry]].

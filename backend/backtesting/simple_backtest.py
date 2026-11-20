@@ -521,8 +521,43 @@ def get_symbol_history(
     return frame.iloc[start_idx:end_idx]
 
 
-def get_price_at_date(prices_df: pd.DataFrame, symbol: str, target_date: datetime,
-                      look_forward_days: int = 5, use_open: bool = False) -> Optional[float]:
+def _history(
+    prices_df: pd.DataFrame,
+    symbol_cache: Optional[Dict[str, Tuple[pd.DataFrame, np.ndarray]]],
+    symbol: str,
+    target_date: datetime,
+    *,
+    tail: Optional[int] = None,
+    strict_before: bool = False,
+) -> Optional[pd.DataFrame]:
+    """Return sorted symbol history up to target_date; never scan prices_df when symbol_cache is provided."""
+    if symbol_cache is not None:
+        cached = symbol_cache.get(symbol)
+        if cached is None:
+            return None
+        frame, dates = cached
+        side = "left" if strict_before else "right"
+        end_idx = int(np.searchsorted(dates, np.datetime64(pd.Timestamp(target_date), "ns"), side=side))
+        if end_idx <= 0:
+            return None
+        start_idx = max(0, end_idx - tail) if tail is not None else 0
+        return frame.iloc[start_idx:end_idx]
+
+    date_mask = prices_df["date"] < target_date if strict_before else prices_df["date"] <= target_date
+    sym_df = prices_df[(prices_df["symbol"] == symbol) & date_mask].sort_values("date")
+    if sym_df.empty:
+        return None
+    return sym_df.tail(tail) if tail is not None else sym_df
+
+
+def get_price_at_date(
+    prices_df: pd.DataFrame,
+    symbol: str,
+    target_date: datetime,
+    look_forward_days: int = 5,
+    use_open: bool = False,
+    symbol_cache: Optional[Dict[str, Tuple[pd.DataFrame, np.ndarray]]] = None,
+) -> Optional[float]:
     """Get price at or after target date (for execution)."""
     result = get_price_with_fill_date(
         prices_df=prices_df,
@@ -530,6 +565,7 @@ def get_price_at_date(prices_df: pd.DataFrame, symbol: str, target_date: datetim
         target_date=target_date,
         look_forward_days=look_forward_days,
         use_open=use_open,
+        symbol_cache=symbol_cache,
     )
     if result is None:
         return None
@@ -543,19 +579,29 @@ def get_price_with_fill_date(
     target_date: datetime,
     look_forward_days: int = 5,
     use_open: bool = False,
+    symbol_cache: Optional[Dict[str, Tuple[pd.DataFrame, np.ndarray]]] = None,
 ) -> Optional[Tuple[pd.Timestamp, float]]:
     """Return (fill_date, price) at or after target_date within look_forward_days."""
-    sym_prices = prices_df[prices_df["symbol"] == symbol].sort_values("date")
-    if sym_prices.empty:
-        return None
-
     target = pd.Timestamp(target_date)
-    future = sym_prices[sym_prices["date"] >= target]
-    if future.empty:
-        return None
+    if symbol_cache is not None:
+        cached = symbol_cache.get(symbol)
+        if cached is None:
+            return None
+        frame, dates = cached
+        idx = int(np.searchsorted(dates, np.datetime64(target, "ns"), side="left"))
+        if idx >= len(dates):
+            return None
+        first_available = frame.iloc[idx]
+    else:
+        sym_prices = prices_df[prices_df["symbol"] == symbol].sort_values("date")
+        if sym_prices.empty:
+            return None
+        future = sym_prices[sym_prices["date"] >= target]
+        if future.empty:
+            return None
+        first_available = future.iloc[0]
 
-    first_available = future.iloc[0]
-    if (first_available["date"] - target).days > look_forward_days:
+    if (pd.Timestamp(first_available["date"]) - target).days > look_forward_days:
         return None
 
     price_col = "open" if use_open else "close"
@@ -567,15 +613,11 @@ def get_price_on_or_before_date(
     symbol: str,
     target_date: datetime,
     use_open: bool = False,
+    symbol_cache: Optional[Dict[str, Tuple[pd.DataFrame, np.ndarray]]] = None,
 ) -> Optional[Tuple[pd.Timestamp, float]]:
     """Return (date, price) using the latest available row on or before target_date."""
-    sym_prices = prices_df[prices_df["symbol"] == symbol].sort_values("date")
-    if sym_prices.empty:
-        return None
-
-    target = pd.Timestamp(target_date)
-    past = sym_prices[sym_prices["date"] <= target]
-    if past.empty:
+    past = _history(prices_df, symbol_cache, symbol, pd.Timestamp(target_date), tail=1)
+    if past is None or past.empty:
         return None
 
     row = past.iloc[-1]
@@ -583,13 +625,15 @@ def get_price_on_or_before_date(
     return pd.Timestamp(row["date"]), float(row[price_col])
 
 
-def get_prev_close(prices_df: pd.DataFrame, symbol: str, target_date: datetime) -> Optional[float]:
+def get_prev_close(
+    prices_df: pd.DataFrame,
+    symbol: str,
+    target_date: datetime,
+    symbol_cache: Optional[Dict[str, Tuple[pd.DataFrame, np.ndarray]]] = None,
+) -> Optional[float]:
     """Get previous trading day's close for circuit breaker calculation."""
-    sym_prices = prices_df[
-        (prices_df["symbol"] == symbol) &
-        (prices_df["date"] < target_date)
-    ].sort_values("date")
-    if sym_prices.empty:
+    sym_prices = _history(prices_df, symbol_cache, symbol, target_date, tail=1, strict_before=True)
+    if sym_prices is None or sym_prices.empty:
         return None
     return float(sym_prices.iloc[-1]["close"])
 
@@ -690,14 +734,8 @@ def generate_momentum_signals_at_date(
     symbols = list(symbol_cache.keys()) if symbol_cache is not None else prices_df["symbol"].unique()
 
     for symbol in symbols:
-        sym_df = get_symbol_history(symbol_cache, symbol, date, tail=lookback_long + 10)
-        if sym_df is None:
-            sym_df = prices_df[
-                (prices_df["symbol"] == symbol) &
-                (prices_df["date"] <= date)
-            ].sort_values("date")
-
-        if len(sym_df) < lookback_long + 10:
+        sym_df = _history(prices_df, symbol_cache, symbol, date, tail=lookback_long + 10)
+        if sym_df is None or len(sym_df) < lookback_long + 10:
             continue
 
         recent = sym_df.tail(lookback_long + 10)
@@ -765,14 +803,8 @@ def generate_volume_breakout_signals_at_date(
     symbols = list(symbol_cache.keys()) if symbol_cache is not None else prices_df["symbol"].unique()
 
     for symbol in symbols:
-        sym_df = get_symbol_history(symbol_cache, symbol, date, tail=65)
-        if sym_df is None:
-            sym_df = prices_df[
-                (prices_df["symbol"] == symbol) &
-                (prices_df["date"] <= date)
-            ].sort_values("date")
-
-        if len(sym_df) < 60:
+        sym_df = _history(prices_df, symbol_cache, symbol, date, tail=65)
+        if sym_df is None or len(sym_df) < 60:
             continue
 
         recent = sym_df.tail(65)
@@ -820,6 +852,7 @@ def generate_corporate_action_signals_at_date(
     min_volume: float = 100000,
     short_term_mode: bool = False,
     trading_dates_list: Optional[List] = None,
+    symbol_cache: Optional[Dict[str, Tuple[pd.DataFrame, np.ndarray]]] = None,
 ) -> List[AlphaSignal]:
     """Generate signals for upcoming corporate actions (dividends/bonuses).
 
@@ -855,12 +888,8 @@ def generate_corporate_action_signals_at_date(
     for _, action in upcoming.iterrows():
         symbol = action["symbol"]
 
-        sym_prices = prices_df[
-            (prices_df["symbol"] == symbol) &
-            (prices_df["date"] <= date)
-        ]
-
-        if len(sym_prices) < 20:
+        sym_prices = _history(prices_df, symbol_cache, symbol, date, tail=20)
+        if sym_prices is None or len(sym_prices) < 20:
             continue
 
         recent = sym_prices.tail(20)
@@ -946,6 +975,7 @@ def generate_settlement_pressure_signals_at_date(
     trading_dates_list: Optional[List] = None,
     min_volume: float = 100000,
     min_drop_pct: float = 0.03,
+    symbol_cache: Optional[Dict[str, Tuple[pd.DataFrame, np.ndarray]]] = None,
 ) -> List[AlphaSignal]:
     """Generate signals from T+2 settlement selling pressure after bookclose.
 
@@ -985,12 +1015,8 @@ def generate_settlement_pressure_signals_at_date(
         if cash_div < 5 and bonus < 10:
             continue
 
-        sym_prices = prices_df[
-            (prices_df["symbol"] == symbol) &
-            (prices_df["date"] <= date)
-        ].sort_values("date")
-
-        if len(sym_prices) < 20:
+        sym_prices = _history(prices_df, symbol_cache, symbol, date)
+        if sym_prices is None or len(sym_prices) < 20:
             continue
 
         # Volume check
@@ -1051,14 +1077,8 @@ def generate_mean_reversion_signals_at_date(
     symbols = list(symbol_cache.keys()) if symbol_cache is not None else prices_df["symbol"].unique()
 
     for symbol in symbols:
-        sym_df = get_symbol_history(symbol_cache, symbol, date, tail=rsi_period + 20)
-        if sym_df is None:
-            sym_df = prices_df[
-                (prices_df["symbol"] == symbol) &
-                (prices_df["date"] <= date)
-            ].sort_values("date")
-
-        if len(sym_df) < rsi_period + 20:
+        sym_df = _history(prices_df, symbol_cache, symbol, date, tail=rsi_period + 20)
+        if sym_df is None or len(sym_df) < rsi_period + 20:
             continue
 
         recent = sym_df.tail(rsi_period + 20)
@@ -1115,14 +1135,8 @@ def generate_low_volatility_signals_at_date(
 
     volatilities = {}
     for symbol in symbols:
-        sym_df = get_symbol_history(symbol_cache, symbol, date, tail=lookback)
-        if sym_df is None:
-            sym_df = prices_df[
-                (prices_df["symbol"] == symbol) &
-                (prices_df["date"] <= date)
-            ].sort_values("date")
-
-        if len(sym_df) < lookback:
+        sym_df = _history(prices_df, symbol_cache, symbol, date, tail=lookback)
+        if sym_df is None or len(sym_df) < lookback:
             continue
 
         recent = sym_df.tail(lookback)
@@ -1148,12 +1162,9 @@ def generate_low_volatility_signals_at_date(
         if vol > threshold:
             continue
 
-        sym_df = get_symbol_history(symbol_cache, symbol, date, tail=lookback)
-        if sym_df is None:
-            sym_df = prices_df[
-                (prices_df["symbol"] == symbol) &
-                (prices_df["date"] <= date)
-            ].sort_values("date").tail(lookback)
+        sym_df = _history(prices_df, symbol_cache, symbol, date, tail=lookback)
+        if sym_df is None or sym_df.empty:
+            continue
 
         close = sym_df["close"]
 
@@ -1187,6 +1198,7 @@ def compute_liquid_universe(
     current_date: datetime,
     percentile_cutoff: int = 30,
     lookback: int = 20,
+    symbol_cache: Optional[Dict[str, Tuple[pd.DataFrame, np.ndarray]]] = None,
 ) -> List[str]:
     """
     Compute the liquid universe by removing bottom N% by 20-day average turnover.
@@ -1196,17 +1208,13 @@ def compute_liquid_universe(
     from illiquid names in the ranking.
     """
     # Exclude non-tradable symbols (market index, sector indices, suspended names)
-    all_symbols = prices_df["symbol"].unique()
+    all_symbols = list(symbol_cache.keys()) if symbol_cache is not None else prices_df["symbol"].unique()
     symbols = [s for s in all_symbols if is_tradeable_signal_symbol(s)]
     turnover_map = {}
 
     for symbol in symbols:
-        sym_df = prices_df[
-            (prices_df["symbol"] == symbol) &
-            (prices_df["date"] <= current_date)
-        ].sort_values("date").tail(lookback)
-
-        if len(sym_df) < lookback // 2:
+        sym_df = _history(prices_df, symbol_cache, symbol, current_date, tail=lookback)
+        if sym_df is None or len(sym_df) < lookback // 2:
             continue
 
         avg_turnover = (sym_df["close"] * sym_df["volume"]).mean()
@@ -1230,6 +1238,7 @@ def generate_xsec_momentum_signals_at_date(
     min_volume: float = 100000,
     top_pct: float = 0.10,
     liquid_symbols: Optional[List[str]] = None,
+    symbol_cache: Optional[Dict[str, Tuple[pd.DataFrame, np.ndarray]]] = None,
 ) -> List[AlphaSignal]:
     """
     Cross-sectional momentum: rank stocks by 6-month return minus last month
@@ -1240,16 +1249,12 @@ def generate_xsec_momentum_signals_at_date(
     selects relative WINNERS — the key to separating alpha from beta.
     """
     signals = []
-    symbols = liquid_symbols if liquid_symbols else prices_df["symbol"].unique()
+    symbols = liquid_symbols if liquid_symbols else (list(symbol_cache.keys()) if symbol_cache is not None else prices_df["symbol"].unique())
 
     scores = {}
     for symbol in symbols:
-        sym_df = prices_df[
-            (prices_df["symbol"] == symbol) &
-            (prices_df["date"] <= date)
-        ].sort_values("date")
-
-        if len(sym_df) < 130:  # Need ~6 months of data
+        sym_df = _history(prices_df, symbol_cache, symbol, date, tail=130)
+        if sym_df is None or len(sym_df) < 130:  # Need ~6 months of data
             continue
 
         recent = sym_df.tail(130)
@@ -1311,6 +1316,7 @@ def generate_accumulation_signals_at_date(
     obv_roc_threshold: float = 0.25,
     cmf_threshold: float = 0.10,
     liquid_symbols: Optional[List[str]] = None,
+    symbol_cache: Optional[Dict[str, Tuple[pd.DataFrame, np.ndarray]]] = None,
 ) -> List[AlphaSignal]:
     """
     Detect sustained accumulation using OBV rate-of-change and Chaikin Money Flow.
@@ -1321,15 +1327,11 @@ def generate_accumulation_signals_at_date(
     OBV rising + CMF positive = smart money accumulating.
     """
     signals = []
-    symbols = liquid_symbols if liquid_symbols else prices_df["symbol"].unique()
+    symbols = liquid_symbols if liquid_symbols else (list(symbol_cache.keys()) if symbol_cache is not None else prices_df["symbol"].unique())
 
     for symbol in symbols:
-        sym_df = prices_df[
-            (prices_df["symbol"] == symbol) &
-            (prices_df["date"] <= date)
-        ].sort_values("date")
-
-        if len(sym_df) < 30:
+        sym_df = _history(prices_df, symbol_cache, symbol, date, tail=30)
+        if sym_df is None or len(sym_df) < 30:
             continue
 
         recent = sym_df.tail(30)
@@ -1400,18 +1402,15 @@ def is_circuit_breaker_hit(
     date: datetime,
     lookback_days: int = 3,
     threshold: float = 0.095,
+    symbol_cache: Optional[Dict[str, Tuple[pd.DataFrame, np.ndarray]]] = None,
 ) -> bool:
     """
     Check if a stock hit or nearly hit the +10% circuit breaker in the last
     N trading days. Stocks hitting CB from retail herding tend to reverse
     within 5-10 days — filter them out of buy signals.
     """
-    sym_df = prices_df[
-        (prices_df["symbol"] == symbol) &
-        (prices_df["date"] <= date)
-    ].sort_values("date").tail(lookback_days + 1)
-
-    if len(sym_df) < 2:
+    sym_df = _history(prices_df, symbol_cache, symbol, date, tail=lookback_days + 1)
+    if sym_df is None or len(sym_df) < 2:
         return False
 
     close = sym_df["close"].values
@@ -1430,6 +1429,7 @@ def generate_52wk_high_signals_at_date(
     proximity_threshold: float = 0.90,  # within 10% of 52W high
     min_volume: float = 100000,
     liquid_symbols: Optional[List[str]] = None,
+    symbol_cache: Optional[Dict[str, Tuple[pd.DataFrame, np.ndarray]]] = None,
 ) -> List[AlphaSignal]:
     """
     52-Week High Proximity signal (George & Hwang 2004).
@@ -1445,20 +1445,17 @@ def generate_52wk_high_signals_at_date(
     NO lookahead bias: uses only data up to and including `date`.
     """
     signals = []
-    symbols = liquid_symbols if liquid_symbols else prices_df["symbol"].unique()
+    symbols = liquid_symbols if liquid_symbols else (list(symbol_cache.keys()) if symbol_cache is not None else prices_df["symbol"].unique())
 
     for symbol in symbols:
         # Skip index entries and suspended/non-tradeable symbols.
         if not is_tradeable_signal_symbol(symbol):
             continue
 
-        sym_df = prices_df[
-            (prices_df["symbol"] == symbol) &
-            (prices_df["date"] <= date)
-        ].sort_values("date")
+        sym_df = _history(prices_df, symbol_cache, symbol, date, tail=252)
 
         # Need at least 252 trading days of history
-        if len(sym_df) < 252:
+        if sym_df is None or len(sym_df) < 252:
             continue
 
         recent = sym_df.tail(252)
@@ -1514,6 +1511,7 @@ def generate_value_bounce_signals_at_date(
     recovery_days: int = 10,                  # must be +ve over last N days
     min_volume: float = 40000,                # lower than other signals — captures small hydro/value
     liquid_symbols: Optional[List[str]] = None,
+    symbol_cache: Optional[Dict[str, Tuple[pd.DataFrame, np.ndarray]]] = None,
 ) -> List[AlphaSignal]:
     """
     Value Bounce / Deep Reversal signal.
@@ -1537,18 +1535,14 @@ def generate_value_bounce_signals_at_date(
     NO lookahead bias: uses only data up to and including `date`.
     """
     signals: List[AlphaSignal] = []
-    symbols = liquid_symbols if liquid_symbols else prices_df["symbol"].unique()
+    symbols = liquid_symbols if liquid_symbols else (list(symbol_cache.keys()) if symbol_cache is not None else prices_df["symbol"].unique())
 
     for symbol in symbols:
         if not is_tradeable_signal_symbol(symbol):
             continue
 
-        sym_df = prices_df[
-            (prices_df["symbol"] == symbol) &
-            (prices_df["date"] <= date)
-        ].sort_values("date")
-
-        if len(sym_df) < 252:
+        sym_df = _history(prices_df, symbol_cache, symbol, date, tail=252)
+        if sym_df is None or len(sym_df) < 252:
             continue
 
         recent = sym_df.tail(252)
@@ -1623,6 +1617,7 @@ def generate_residual_momentum_signals_at_date(
     skip_period: int = 21,  # skip last month
     min_volume: float = 100000,
     liquid_symbols: Optional[List[str]] = None,
+    symbol_cache: Optional[Dict[str, Tuple[pd.DataFrame, np.ndarray]]] = None,
 ) -> List[AlphaSignal]:
     """
     Residual Momentum / IMOM (Blitz, Huij & Martens 2011).
@@ -1642,13 +1637,9 @@ def generate_residual_momentum_signals_at_date(
     required_days = formation_period + skip_period
 
     # Step 1: Get NEPSE index returns (the market factor)
-    nepse_df = prices_df[
-        (prices_df["symbol"] == "NEPSE") &
-        (prices_df["date"] <= date)
-    ].sort_values("date")
-
-    if len(nepse_df) < required_days + 1:
-        logger.debug(f"IMOM: Insufficient NEPSE index data ({len(nepse_df)} rows)")
+    nepse_df = _history(prices_df, symbol_cache, "NEPSE", date)
+    if nepse_df is None or len(nepse_df) < required_days + 1:
+        logger.debug(f"IMOM: Insufficient NEPSE index data ({0 if nepse_df is None else len(nepse_df)} rows)")
         return signals
 
     nepse_close = nepse_df["close"].values
@@ -1661,7 +1652,7 @@ def generate_residual_momentum_signals_at_date(
         nepse_ret_map[pd.Timestamp(d)] = r
 
     # Step 2: For each stock, regress on NEPSE and compute residual momentum
-    symbols = liquid_symbols if liquid_symbols else prices_df["symbol"].unique()
+    symbols = liquid_symbols if liquid_symbols else (list(symbol_cache.keys()) if symbol_cache is not None else prices_df["symbol"].unique())
     residual_scores = {}
 
     for symbol in symbols:
@@ -1669,12 +1660,8 @@ def generate_residual_momentum_signals_at_date(
         if not is_tradeable_signal_symbol(symbol):
             continue
 
-        sym_df = prices_df[
-            (prices_df["symbol"] == symbol) &
-            (prices_df["date"] <= date)
-        ].sort_values("date")
-
-        if len(sym_df) < required_days + 1:
+        sym_df = _history(prices_df, symbol_cache, symbol, date, tail=required_days + 1)
+        if sym_df is None or len(sym_df) < required_days + 1:
             continue
 
         recent = sym_df.tail(required_days + 1)
@@ -1772,6 +1759,7 @@ def apply_amihud_tilt(
     date: datetime,
     lookback: int = 60,
     tilt_boost: float = 0.10,  # 10% score boost for optimal illiquidity
+    symbol_cache: Optional[Dict[str, Tuple[pd.DataFrame, np.ndarray]]] = None,
 ) -> List[AlphaSignal]:
     """
     Amihud Illiquidity Factor Tilt (Amihud 2002).
@@ -1795,12 +1783,8 @@ def apply_amihud_tilt(
         if sig.symbol in symbol_illiq:
             continue  # Already computed for this symbol
 
-        sym_df = prices_df[
-            (prices_df["symbol"] == sig.symbol) &
-            (prices_df["date"] <= date)
-        ].sort_values("date").tail(lookback)
-
-        if len(sym_df) < lookback // 2:
+        sym_df = _history(prices_df, symbol_cache, sig.symbol, date, tail=lookback)
+        if sym_df is None or len(sym_df) < lookback // 2:
             continue
 
         close = sym_df["close"].values
@@ -1875,14 +1859,8 @@ def generate_quality_signals_at_date(
     symbols = list(symbol_cache.keys()) if symbol_cache is not None else prices_df["symbol"].unique()
 
     for symbol in symbols:
-        sym_df = get_symbol_history(symbol_cache, symbol, date, tail=lookback)
-        if sym_df is None:
-            sym_df = prices_df[
-                (prices_df["symbol"] == symbol) &
-                (prices_df["date"] <= date)
-            ].sort_values("date")
-
-        if len(sym_df) < lookback:
+        sym_df = _history(prices_df, symbol_cache, symbol, date, tail=lookback)
+        if sym_df is None or len(sym_df) < lookback:
             continue
 
         recent = sym_df.tail(lookback)
@@ -1948,18 +1926,16 @@ def generate_quarterly_fundamental_signals_at_date(
     *,
     min_volume: float = 100000,
     liquid_symbols: Optional[List[str]] = None,
+    symbol_cache: Optional[Dict[str, Tuple[pd.DataFrame, np.ndarray]]] = None,
 ) -> List[AlphaSignal]:
     """Generate point-in-time quarterly fundamental signals."""
-    symbols = liquid_symbols if liquid_symbols else list(prices_df["symbol"].unique())
+    symbols = liquid_symbols if liquid_symbols else (list(symbol_cache.keys()) if symbol_cache is not None else list(prices_df["symbol"].unique()))
     current_prices: Dict[str, float] = {}
     eligible_symbols: List[str] = []
 
     for symbol in symbols:
-        sym_df = prices_df[
-            (prices_df["symbol"] == symbol) &
-            (prices_df["date"] <= date)
-        ].sort_values("date")
-        if len(sym_df) < 20:
+        sym_df = _history(prices_df, symbol_cache, symbol, date, tail=20)
+        if sym_df is None or len(sym_df) < 20:
             continue
 
         recent = sym_df.tail(20)
@@ -2330,8 +2306,11 @@ def run_backtest(
             # This fires independently of trailing stop state
             if exit_reason is None and trading_days_held >= trade.max_holding_days:
                 exit_reason = "holding_period"
-                close_price = get_price_at_date(prices_df, symbol, current_date,
-                                                look_forward_days=0, use_open=False)
+                close_price = get_price_at_date(
+                    prices_df, symbol, current_date,
+                    look_forward_days=0, use_open=False,
+                    symbol_cache=symbol_cache,
+                )
                 if close_price is not None:
                     if prev_close is not None:
                         close_price = apply_circuit_breaker(close_price, prev_close)
@@ -2402,7 +2381,9 @@ def run_backtest(
                 "nlp_sentiment", "quarterly_fundamental",
                 "value_bounce", "smart_money", "smart_money_pure",
             ]):
-                liquid_symbols = compute_liquid_universe(prices_df, current_date)
+                liquid_symbols = compute_liquid_universe(
+                    prices_df, current_date, symbol_cache=symbol_cache
+                )
 
             # Generate signals
             all_signals: List[AlphaSignal] = []
@@ -2421,12 +2402,14 @@ def run_backtest(
                     prices_df, corp_actions_df, current_date,
                     short_term_mode=event_exit_mode,
                     trading_dates_list=trading_dates,
+                    symbol_cache=symbol_cache,
                 ))
 
             if "settlement_pressure" in signal_types and corp_actions_df is not None:
                 all_signals.extend(generate_settlement_pressure_signals_at_date(
                     prices_df, corp_actions_df, current_date,
                     trading_dates_list=trading_dates,
+                    symbol_cache=symbol_cache,
                 ))
 
             if "low_vol" in signal_types:
@@ -2437,32 +2420,33 @@ def run_backtest(
 
             if "quarterly_fundamental" in signal_types and quarterly_fundamental_model is not None:
                 all_signals.extend(generate_quarterly_fundamental_signals_at_date(
-                    prices_df, current_date, quarterly_fundamental_model, liquid_symbols=liquid_symbols
+                    prices_df, current_date, quarterly_fundamental_model,
+                    liquid_symbols=liquid_symbols, symbol_cache=symbol_cache,
                 ))
 
             if "xsec_momentum" in signal_types:
                 all_signals.extend(generate_xsec_momentum_signals_at_date(
-                    prices_df, current_date, liquid_symbols=liquid_symbols
+                    prices_df, current_date, liquid_symbols=liquid_symbols, symbol_cache=symbol_cache
                 ))
 
             if "accumulation" in signal_types:
                 all_signals.extend(generate_accumulation_signals_at_date(
-                    prices_df, current_date, liquid_symbols=liquid_symbols
+                    prices_df, current_date, liquid_symbols=liquid_symbols, symbol_cache=symbol_cache
                 ))
 
             if "52wk_high" in signal_types:
                 all_signals.extend(generate_52wk_high_signals_at_date(
-                    prices_df, current_date, liquid_symbols=liquid_symbols
+                    prices_df, current_date, liquid_symbols=liquid_symbols, symbol_cache=symbol_cache
                 ))
 
             if "value_bounce" in signal_types:
                 all_signals.extend(generate_value_bounce_signals_at_date(
-                    prices_df, current_date, liquid_symbols=liquid_symbols
+                    prices_df, current_date, liquid_symbols=liquid_symbols, symbol_cache=symbol_cache
                 ))
 
             if "residual_momentum" in signal_types:
                 all_signals.extend(generate_residual_momentum_signals_at_date(
-                    prices_df, current_date, liquid_symbols=liquid_symbols
+                    prices_df, current_date, liquid_symbols=liquid_symbols, symbol_cache=symbol_cache
                 ))
 
             if "disposition" in signal_types:
@@ -2501,7 +2485,9 @@ def run_backtest(
 
             # Amihud illiquidity tilt: boost moderately illiquid stocks
             if "amihud_tilt" in signal_types and all_signals:
-                all_signals = apply_amihud_tilt(all_signals, prices_df, current_date)
+                all_signals = apply_amihud_tilt(
+                    all_signals, prices_df, current_date, symbol_cache=symbol_cache
+                )
 
             # Regime-adaptive signal weighting
             # Always applied when use_regime_filter=True (not gated by signal types)
@@ -2554,7 +2540,9 @@ def run_backtest(
             # CB filter fires on +9.5% moves — extremely rare for quality/low_vol stocks
             all_signals = [
                 sig for sig in all_signals
-                if not is_circuit_breaker_hit(prices_df, sig.symbol, current_date)
+                if not is_circuit_breaker_hit(
+                    prices_df, sig.symbol, current_date, symbol_cache=symbol_cache
+                )
             ]
 
             # Queue top signals for next-day execution using the shared ranker.
@@ -2638,7 +2626,7 @@ def run_backtest(
     # Close remaining positions at last available price
     _emit_progress({"phase": "finalizing", "progress_pct": 100, "message": "Finalizing positions"})
     for symbol, trade in current_positions.items():
-        exit_fill = get_price_on_or_before_date(prices_df, symbol, end)
+        exit_fill = get_price_on_or_before_date(prices_df, symbol, end, symbol_cache=symbol_cache)
         if exit_fill:
             exit_date, exit_price = exit_fill
             sell_fees = NepseFees.total_fees(trade.shares, exit_price, is_sell=True)

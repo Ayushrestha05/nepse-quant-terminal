@@ -1,0 +1,73 @@
+{
+  "start_date": "2023-01-01",
+  "end_date": "2023-04-30",
+  "strategy": "default_c5",
+  "wall_seconds": 489.449,
+  "final_nav": 1009719.1974426,
+  "trade_count": 9,
+  "trades": [
+    {
+      "symbol": "TRH",
+      "entry_date": "2023-01-02",
+      "exit_date": "2023-01-12",
+      "exit_reason": "trailing_stop",
+      "signal_type": "liquidity"
+    },
+    {
+      "symbol": "PICL",
+      "entry_date": "2023-01-02",
+      "exit_date": "2023-02-01",
+      "exit_reason": "trailing_stop",
+      "signal_type": "liquidity"
+    },
+    {
+      "symbol": "NABIL",
+      "entry_date": "2023-01-02",
+      "exit_date": "2023-02-15",
+      "exit_reason": "stop_loss",
+      "signal_type": "fundamental"
+    },
+    {
+      "symbol": "UAIL",
+      "entry_date": "2023-01-02",
+      "exit_date": "2023-02-16",
+      "exit_reason": "trailing_stop",
+      "signal_type": "liquidity"
+    },
+    {
+      "symbol": "NMB50",
+      "entry_date": "2023-02-22",
+      "exit_date": "2023-03-01",
+      "exit_reason": "trailing_stop",
+      "signal_type": "liquidity"
+    },
+    {
+      "symbol": "BARUN",
+      "entry_date": "2023-01-02",
+      "exit_date": "2023-03-07",
+      "exit_reason": "trailing_stop",
+      "signal_type": "liquidity"
+    },
+    {
+      "symbol": "NICA",
+      "entry_date": "2023-01-18",
+      "exit_date": "2023-03-15",
+      "exit_reason": "trailing_stop",
+      "signal_type": "fundamental"
+    },
+    {
+      "symbol": "RIDI",
+      "entry_date": "2023-02-22",
+      "exit_date": "2023-04-03",
+      "exit_reason": "trailing_stop",
+      "signal_type": "xsec_momentum"
+    },
+    {
+      "symbol": "LGIL",
+      "entry_date": "2023-02-06",
+      "exit_date": "2023-03-12",
+      "exit_reason": "end_of_backtest",
+      "signal_type": "liquidity"
+    }
+  ]
+}
