@@ -48,6 +48,9 @@ anthropic>=2.0,<3
 # ── Misc ──────────────────────────────────────────────────────────────────────
 Pillow>=10.0
 pytest>=7.0
+# Nepali (BS) calendar + festival patro (install with --pre / --prerelease=allow)
+nepdate-core==1.0.0rc1
+nepdate-patro==1.0.0rc1
 # mcp pulls in starlette+uvicorn for the streamable-http transport
 mcp>=1.0
 SQLAlchemy>=2.0

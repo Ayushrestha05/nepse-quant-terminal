@@ -29,9 +29,19 @@ Cross-check cache: `data/runtime/crosscheck/`.
 - **Exclude:** symbols where menaceXnadin overlap has >5% of days with close mismatch >1%
 - **Engine:** `run_backtest(..., exclude_symbols=…)` fees + stops + regime filter; **no slippage**
 
-## Metrics (`2020-01-01` → `2026-11-19`, full run)
+## Metrics (`2020-01-01` → `2026-11-19`)
 
-| Metric | C5 (`default_c5`) | NEPSE buy-and-hold (to `2026-04-15`) |
+### NAV-based sizing across all 3 standard scenarios (ADR-003, [[2026-11-20 - C5 Baseline (NAV Sizing)]])
+
+| Scenario | Contributed | Final NAV | TWR CAGR | XIRR | Sharpe | Max DD | Trades | Fees % Inv | OOS CAGR (25-26) | OOS Sharpe |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `lump_10l` (10L Lump Sum) | NPR 1,000,000 | NPR 2,803,468 | **+16.14%** | +16.14% | **0.95** | -54.62% | 196 | 70.70% | +15.79% | 1.26 |
+| `lump_1l` (1L Lump Sum) | NPR 100,000 | NPR 175,149 | **+8.48%** | +8.48% | **0.54** | -54.54% | 171 | 68.17% | +12.12% | 0.88 |
+| `sip_5k` (5K + 5K/BS Month) | NPR 415,000 | NPR 507,799 | **+5.27%** | **+5.86%** | **0.38** | -53.58% | 165 | 19.25% | +15.11% | 1.22 |
+
+### Legacy fixed-capital sizing (`2020-01-01` → `2026-11-19`, [[2026-11-20 - C5 Baseline]])
+
+| Metric | C5 (`default_c5`, legacy) | NEPSE buy-and-hold (to `2026-04-15`) |
 | --- | ---: | ---: |
 | Start → End NAV / Close | NPR 1,000,000 → 2,210,873 | 1,169.50 → 2,833.60 |
 | Total return | **+121.09%** | +142.29% |

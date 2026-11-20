@@ -9,7 +9,7 @@
 *.sqlite3
 
 # === Data directory (runtime state, caches, databases, CSVs) ===
-data/
+data/*
 # Strategy registry is committed — it ships with built-in strategy configs
 !data/strategy_registry/
 !data/strategy_registry/**

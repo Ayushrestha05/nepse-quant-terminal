@@ -22,7 +22,8 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from backend.backtesting.simple_backtest import run_backtest
+from backend.backtesting.results_store import has_run, save_run
+from backend.backtesting.simple_backtest import CAPITAL_SCENARIOS, run_backtest
 from backend.quant_pro.database import get_db_path
 from backend.quant_pro.paths import get_runtime_dir
 from scripts.validation.baseline_crosscheck import (
@@ -71,12 +72,17 @@ def _nepse_buy_hold(conn: sqlite3.Connection, start: str, end: str) -> dict:
 
 
 def _result_metrics(result) -> dict:
-    final_nav = result.daily_nav[-1][1] if result.daily_nav else result.initial_capital
+    final_nav = result.final_nav
     return {
         "initial_capital": result.initial_capital,
+        "total_contributed": result.total_contributed,
+        "contributions_count": len(result.contributions),
         "final_nav": final_nav,
         "total_return": result.total_return,
         "annualized_return": result.annualized_return,
+        "twr_total_return": result.twr_total_return,
+        "twr_annualized_return": result.twr_annualized_return,
+        "xirr": result.xirr,
         "volatility": result.volatility,
         "sharpe_ratio": result.sharpe_ratio,
         "sortino_ratio": result.sortino_ratio,
@@ -138,24 +144,85 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Exclude ({len(exclude_symbols)}): {sorted(exclude_symbols) or 'none'}")
 
     cfg = _load_c5_config()
-    # Drop non-run_backtest keys if any
     allowed = {
-        "holding_days", "max_positions", "signal_types", "initial_capital",
+        "holding_days", "max_positions", "signal_types",
         "rebalance_frequency", "use_trailing_stop", "trailing_stop_pct",
         "stop_loss_pct", "use_regime_filter", "sector_limit",
         "regime_max_positions", "bear_threshold", "profit_target_pct",
         "event_exit_mode", "regime_sector_limits",
     }
-    bt_kwargs = {k: v for k, v in cfg.items() if k in allowed}
+    base_kwargs = {k: v for k, v in cfg.items() if k in allowed}
 
-    print("Running C5 backtest…")
-    result = run_backtest(
-        start_date=start,
-        end_date=end,
-        exclude_symbols=exclude_symbols or None,
-        **bt_kwargs,
-    )
-    print(result.summary())
+    scenario_results = {}
+    scenario_run_ids = {}
+    summary_chunks = []
+    for scenario_key, spec in CAPITAL_SCENARIOS.items():
+        scen_cfg = dict(base_kwargs)
+        scen_cfg["initial_capital"] = spec["initial_capital"]
+        scen_cfg["monthly_contribution"] = spec["monthly_contribution"]
+        if exclude_symbols:
+            scen_cfg["exclude_symbols"] = sorted(exclude_symbols)
+
+        existing_id = None if args.force else has_run(
+            strategy_id="default_c5",
+            scenario=scenario_key,
+            config=scen_cfg,
+            data_end=db_max,
+            start_date=start,
+            end_date=end,
+        )
+        print(f"Running C5 backtest [{scenario_key}: {spec['label']}]…")
+        result = run_backtest(
+            start_date=start,
+            end_date=end,
+            exclude_symbols=exclude_symbols or None,
+            initial_capital=spec["initial_capital"],
+            monthly_contribution=spec["monthly_contribution"],
+            **base_kwargs,
+        )
+        print(result.summary())
+        run_id = existing_id if existing_id is not None else save_run(
+            strategy_id="default_c5",
+            scenario=scenario_key,
+            config=scen_cfg,
+            result=result,
+            data_end=db_max,
+        )
+        scenario_results[scenario_key] = result
+        scenario_run_ids[scenario_key] = run_id
+        summary_chunks.append(f"=== SCENARIO: {scenario_key} ({spec['label']}) [run_id={run_id}] ===\n{result.summary()}")
+
+        if result.trades:
+            trades_df = pd.DataFrame(
+                [
+                    {
+                        "symbol": t.symbol,
+                        "signal_date": t.signal_date,
+                        "entry_date": t.entry_date,
+                        "entry_price": t.entry_price,
+                        "shares": t.shares,
+                        "exit_date": t.exit_date,
+                        "exit_price": t.exit_price,
+                        "signal_type": t.signal_type,
+                        "exit_reason": t.exit_reason,
+                        "gross_return": t.gross_return,
+                        "net_return": t.net_return,
+                        "net_pnl": t.net_pnl,
+                        "holding_days": t.holding_days,
+                    }
+                    for t in result.trades
+                    if t.net_return is not None
+                ]
+            )
+            trades_df.to_csv(out_dir / f"trades_{scenario_key}.csv", index=False)
+            if scenario_key == "lump_10l":
+                trades_df.to_csv(out_dir / "trades.csv", index=False)
+
+        if result.daily_nav:
+            nav_df = pd.DataFrame(result.daily_nav, columns=["date", "nav"])
+            nav_df.to_csv(out_dir / f"nav_{scenario_key}.csv", index=False)
+            if scenario_key == "lump_10l":
+                nav_df.to_csv(out_dir / "nav.csv", index=False)
 
     nepse = _nepse_buy_hold(conn, start, end)
     conn.close()
@@ -164,7 +231,9 @@ def main(argv: list[str] | None = None) -> int:
         "run_date": run_date,
         "strategy_id": "default_c5",
         "window": {"start": start, "end": end, "db_min": db_min, "db_max": db_max},
-        "strategy": _result_metrics(result),
+        "strategy": _result_metrics(scenario_results["lump_10l"]),
+        "scenarios": {k: _result_metrics(v) for k, v in scenario_results.items()},
+        "backtests_db_run_ids": scenario_run_ids,
         "nepse_buy_hold": nepse,
         "crosscheck": xrows,
         "excluded_symbols": sorted(exclude_symbols),
@@ -192,40 +261,13 @@ def main(argv: list[str] | None = None) -> int:
 
     (out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2, default=str))
     (out_dir / "summary.txt").write_text(
-        result.summary()
+        "\n\n".join(summary_chunks)
         + "\n\nNEPSE buy-and-hold:\n"
         + json.dumps(nepse, indent=2)
         + "\n\nExcluded: "
         + ", ".join(sorted(exclude_symbols) or ["none"])
         + "\n"
     )
-
-    if result.trades:
-        trades_df = pd.DataFrame(
-            [
-                {
-                    "symbol": t.symbol,
-                    "signal_date": t.signal_date,
-                    "entry_date": t.entry_date,
-                    "entry_price": t.entry_price,
-                    "shares": t.shares,
-                    "exit_date": t.exit_date,
-                    "exit_price": t.exit_price,
-                    "signal_type": t.signal_type,
-                    "exit_reason": t.exit_reason,
-                    "gross_return": t.gross_return,
-                    "net_return": t.net_return,
-                    "net_pnl": t.net_pnl,
-                    "holding_days": t.holding_days,
-                }
-                for t in result.trades
-                if t.net_return is not None
-            ]
-        )
-        trades_df.to_csv(out_dir / "trades.csv", index=False)
-
-    if result.daily_nav:
-        pd.DataFrame(result.daily_nav, columns=["date", "nav"]).to_csv(out_dir / "nav.csv", index=False)
 
     print(f"\nWrote {out_dir}")
     return 0

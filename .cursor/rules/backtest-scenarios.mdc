@@ -1,0 +1,22 @@
+---
+description: Require all 3 NEPSE capital scenarios and trade DB persistence on every backtest
+alwaysApply: true
+---
+
+# Backtest Capital Scenarios & Trade DB
+
+Every backtest run in this repository must evaluate all three standard capital scenarios defined in `CAPITAL_SCENARIOS` (`backend/backtesting/simple_backtest.py`) and persist results to `data/backtests.db` via `backend/backtesting/results_store.py`.
+
+## Standard scenarios (`CAPITAL_SCENARIOS`)
+
+1. `lump_10l` — NPR 1,000,000 starting capital, NPR 0/month
+2. `lump_1l` — NPR 100,000 starting capital, NPR 0/month
+3. `sip_5k` — NPR 5,000 starting capital + NPR 5,000 on the first trading day of each Bikram Sambat (BS) month (`backend/quant_pro/nepal_calendar.py:bs_month_starts`)
+
+## Mandatory rules
+
+1. **All 3 scenarios by default:** Never report a single-capital backtest as a full evaluation; loop over `CAPITAL_SCENARIOS` (as in `scripts/validation/run_baseline.py` and `scripts/validation/run_strategy_suite.py`).
+2. **Persist every run:** Write run metadata, every `Trade`, daily NAV (`nav`, `cash`, `invested`), and monthly contributions into `data/backtests.db` via `save_run(...)`. Check `has_run(...)` first to skip unchanged runs unless `--force` is passed. Never commit `data/backtests.db`.
+3. **Report both TWR and XIRR:** Always report time-weighted return (`twr_total_return`, `twr_annualized_return`, Sharpe, Max DD from TWR) alongside money-weighted `xirr` and `total_contributed` vs `final_nav`.
+4. **No lookahead / split discipline:** Any combination or parameter selection must use only the in-sample window (`2020-01-01..2024-12-31`) and report `2025-01-01+` separately as out-of-sample.
+5. **Keep realistic NEPSE sizing & fees:** Size positions from current account NAV with `effective_max_positions_for_nav`, enforce the 10-share minimum lot (no arbitrary NPR 10K floor), and keep full NEPSE fees including the NPR 25 DP charge.

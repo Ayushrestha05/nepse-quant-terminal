@@ -20,3 +20,13 @@ Accepted ADRs are immutable; supersede with a new number.
 - **Context:** `graphify-out/` regenerates deterministically and pollutes PR review / merges.
 - **Decision:** Gitignore artifacts; never review them on GitHub; on conflict delete and recreate with `graphify extract . --code-only` (+ `cluster-only` as needed).
 - **Consequences:** Agents rebuild graphs locally; vault summarizes via [[Graphify]].
+
+## ADR-003 — Account-value sizing, 3 standard capital scenarios, and separate `data/backtests.db`
+
+- **Status:** Accepted (2026-11-20)
+- **Context:** The original backtest engine sized positions off static `initial_capital` with a hard NPR 10,000 minimum position floor and saved trades only to gitignored `trades.csv`. Monthly SIP deposits sat idle in cash, small retail accounts (NPR 5,000 start) could never open a trade, and runs were not queryable across strategies or scenarios.
+- **Decision:**
+  1. Size positions from current account NAV (`nav / effective_max_positions_for_nav`), remove the NPR 10,000 floor, preserve the 10-share minimum lot and full NEPSE fees (including NPR 25 DP charge), and scale max concurrent positions for small accounts.
+  2. Standardize every backtest on three `CAPITAL_SCENARIOS`: `lump_10l` (NPR 10L), `lump_1l` (NPR 1L), and `sip_5k` (NPR 5K start + NPR 5K on the first trading day of each BS month via `nepdate-core`), reporting both TWR and XIRR. Enforced via `.cursor/rules/backtest-scenarios.mdc`.
+  3. Persist all runs, trades, daily NAV (`nav`, `cash`, `invested`), and contributions into a dedicated, gitignored SQLite database `data/backtests.db` (`backend/backtesting/results_store.py`), skipping unchanged `(strategy_id, scenario, config_hash, data_end, window)` runs unless `--force` is passed.
+- **Consequences:** All historical baselines (including C5) are re-run under NAV sizing for comparability; legacy fixed-capital reports remain preserved as historical records in [[Backtest Reports]]. Every future strategy evaluation produces queryable trade ledgers across small and large retail Nepali accounts.

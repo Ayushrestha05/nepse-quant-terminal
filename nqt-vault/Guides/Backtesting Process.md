@@ -8,10 +8,25 @@ status: active
 
 End-to-end guide for running, profiling, and documenting paper backtests in NEPSE Quant Terminal.
 
-- **Engine:** `backend/backtesting/simple_backtest.py` (`run_backtest`)
-- **Strategy configs:** `data/strategy_registry/builtin/*.json` (e.g. `default_c5.json`, see [[Strategy Registry]])
-- **Baseline runner:** `scripts/validation/run_baseline.py`
-- **Parity test:** `tests/test_backtest_parity.py` (fixture: `tests/fixtures/c5_2023q1_reference.json`)
+- **Engine:** `backend/backtesting/simple_backtest.py` (`run_backtest`, `CAPITAL_SCENARIOS`)
+- **Trade store:** `backend/backtesting/results_store.py` → `data/backtests.db` (`runs`, `trades`, `daily_nav`, `contributions`; gitignored)
+- **Strategy configs:** `data/strategy_registry/builtin/*.json` (see [[Strategy Registry]], [[Strategy Catalog]])
+- **Runners:** `scripts/validation/run_baseline.py` (C5 across 3 scenarios) · `scripts/validation/run_strategy_suite.py` (full parallel suite + vault reports)
+- **Tests:** `tests/test_backtest_parity.py` · `tests/unit/test_capital_scenarios.py`
+
+## Standard capital scenarios (mandatory)
+
+Every backtest runs all three `CAPITAL_SCENARIOS` (enforced by `.cursor/rules/backtest-scenarios.mdc` and ADR-003 in [[Decision Log]]):
+
+1. `lump_10l` — NPR 1,000,000 lump sum (NPR 0/month)
+2. `lump_1l` — NPR 100,000 lump sum (NPR 0/month)
+3. `sip_5k` — NPR 5,000 initial + NPR 5,000 on the first trading day of each Bikram Sambat (BS) month (`backend/quant_pro/nepal_calendar.py`)
+
+**Sizing & metrics:**
+- Equal-weight sizing from **current account NAV** (`nav / effective_max_positions`), not fixed `initial_capital`.
+- Small-account position caps (`effective_max_positions_for_nav`: 1 under NPR 20K, 2 under 50K, 3 under 100K, 4 under 250K); no NPR 10K minimum floor, 10-share minimum lot preserved, full NEPSE fees including NPR 25 DP charge.
+- Performance reported as both **Time-Weighted Return (TWR)** (CAGR, Sharpe, Sortino, Max DD unaffected by deposits) and **XIRR** (money-weighted return) plus `total_contributed` vs `final_nav`.
+- Combination selection uses only `2020-01-01..2024-12-31` in-sample results; `2025-01-01+` is reported separately as out-of-sample (OOS).
 
 ## How to run
 
@@ -20,11 +35,14 @@ End-to-end guide for running, profiling, and documenting paper backtests in NEPS
 .venv/bin/python setup_data.py
 .venv/bin/python setup_data.py --scrape --days 230
 
-# 2. Run the C5 paper baseline (writes artifacts under data/runtime/baselines/<run_date>/)
+# 2. Run C5 baseline across all 3 scenarios (writes data/backtests.db + data/runtime/baselines/<run_date>/)
 .venv/bin/python scripts/validation/run_baseline.py --force
 
-# 3. Verify engine parity on the Q1-2023 regression slice
-.venv/bin/pytest -s tests/test_backtest_parity.py
+# 3. Run the full NEPSE strategy suite (parallel, skips unchanged runs in data/backtests.db)
+.venv/bin/python scripts/validation/run_strategy_suite.py
+
+# 4. Verify capital scenarios, XIRR, and no-lookahead tests
+.venv/bin/pytest tests/unit/test_capital_scenarios.py
 ```
 
 ### Runtime outputs (gitignored)

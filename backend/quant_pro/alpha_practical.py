@@ -34,6 +34,13 @@ class SignalType(Enum):
     NLP_SENTIMENT = "nlp_sentiment"
     SETTLEMENT_PRESSURE = "settlement_pressure"
     VALUE_BOUNCE = "value_bounce"
+    BOOK_CLOSURE_RUNUP = "book_closure_runup"
+    EX_DATE_GAP = "ex_date_gap"
+    CIRCUIT_CONTINUATION = "circuit_continuation"
+    IPO_MOMENTUM = "ipo_momentum"
+    SECTOR_ROTATION = "sector_rotation"
+    CALENDAR_FESTIVAL = "calendar_festival"
+    NRB_POLICY = "nrb_policy"
 
 
 @dataclass

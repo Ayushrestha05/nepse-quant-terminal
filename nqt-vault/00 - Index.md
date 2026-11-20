@@ -40,6 +40,7 @@ Keyboard-driven research and **paper-trading** terminal for the Nepal Stock Exch
 - [[Paper Trading]]
 - [[Signal Engine]]
 - [[Strategy Registry]]
+- [[Strategy Catalog]]
 - [[AI Analyst]]
 - [[Nepse Agents Graph]]
 - [[News Sentiment Pipeline]]

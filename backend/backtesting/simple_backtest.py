@@ -49,9 +49,24 @@ from backend.quant_pro.pairs_trading import generate_pairs_signals_at_date
 # Sprint 4-5 signal imports (Alt data + Earnings + Sentiment)
 from backend.quant_pro.satellite_data import generate_hydro_rainfall_signals_at_date
 from backend.quant_pro.macro_signals import generate_remittance_signals_at_date
-# Signal plugin: earnings_drift (not included in public release)
 from backend.quant_pro.nepali_sentiment import generate_sentiment_signals_at_date
 from backend.quant_pro.quarterly_fundamental import QuarterlyFundamentalModel
+
+# NEPSE-specific event / structural / calendar signal imports
+from backend.backtesting.nepse_event_signals import (
+    build_synthetic_sector_indices,
+    generate_book_closure_runup_signals_at_date,
+    generate_calendar_festival_signals_at_date,
+    generate_circuit_continuation_signals_at_date,
+    generate_earnings_drift_signals_at_date,
+    generate_ex_date_gap_signals_at_date,
+    generate_ipo_momentum_signals_at_date,
+    generate_lead_lag_signals_at_date,
+    generate_nrb_policy_signals_at_date,
+    generate_sector_rotation_signals_at_date,
+    load_merger_symbols,
+    load_quarterly_earnings_df,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -63,8 +78,83 @@ logger = logging.getLogger(__name__)
 
 from validation.transaction_costs import TransactionCostModel as NepseFees  # noqa: E402
 
+from scipy.optimize import brentq
+
+from backend.quant_pro.nepal_calendar import bs_month_starts
+
 # NEPSE trades Sun-Thu (~240 trading days/year vs NYSE's 252)
 NEPSE_TRADING_DAYS = 240
+
+# Standard capital scenarios required across all backtest runs
+CAPITAL_SCENARIOS: Dict[str, Dict[str, Any]] = {
+    "lump_10l": {
+        "label": "10L Lump Sum",
+        "initial_capital": 1_000_000.0,
+        "monthly_contribution": 0.0,
+    },
+    "lump_1l": {
+        "label": "1L Lump Sum",
+        "initial_capital": 100_000.0,
+        "monthly_contribution": 0.0,
+    },
+    "sip_5k": {
+        "label": "5K + 5K/BS Month",
+        "initial_capital": 5_000.0,
+        "monthly_contribution": 5_000.0,
+    },
+}
+
+
+def effective_max_positions_for_nav(nav: float, max_positions: int) -> int:
+    """Cap concurrent positions for small accounts so 10-share minimum lots remain feasible."""
+    if nav < 20_000:
+        cap = 1
+    elif nav < 50_000:
+        cap = 2
+    elif nav < 100_000:
+        cap = 3
+    elif nav < 250_000:
+        cap = 4
+    else:
+        cap = max_positions
+    return max(1, min(max_positions, cap))
+
+
+def compute_xirr(cashflows: List[Tuple[Any, float]]) -> Optional[float]:
+    """Compute annualized money-weighted IRR (XIRR) for dated cash flows.
+
+    Negative amounts are contributions/outflows; positive amounts are terminal/inflows.
+    Returns None if cash flows do not change sign or span zero days.
+    """
+    if len(cashflows) < 2:
+        return None
+    dates = [pd.Timestamp(dt) for dt, _ in cashflows]
+    amounts = [float(amt) for _, amt in cashflows]
+    if not (any(a < 0 for a in amounts) and any(a > 0 for a in amounts)):
+        return None
+    t0 = dates[0]
+    years = [(d - t0).days / 365.0 for d in dates]
+    if max(years) <= 0:
+        return None
+
+    def npv(rate: float) -> float:
+        base = 1.0 + rate
+        if base <= 0:
+            return float("inf")
+        return sum(a / (base ** y) for a, y in zip(amounts, years))
+
+    # Find a sign-changing bracket around realistic annualized returns
+    grid = [-0.999, -0.95, -0.8, -0.5, -0.2, 0.0, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 50.0]
+    vals = [npv(r) for r in grid]
+    for lo, hi, vlo, vhi in zip(grid, grid[1:], vals, vals[1:]):
+        if vlo == 0.0:
+            return float(lo)
+        if np.isfinite(vlo) and np.isfinite(vhi) and vlo * vhi < 0:
+            try:
+                return float(brentq(npv, lo, hi, maxiter=200))
+            except Exception:
+                continue
+    return None
 
 
 # =============================================================================
@@ -152,6 +242,16 @@ class BacktestResult:
     holding_period: int
     initial_capital: float
     daily_nav: List[Tuple[Any, float]]  # [(date, nav_value), ...]
+    contributions: List[Tuple[Any, float]] = field(default_factory=list)  # [(date, amount), ...]
+    daily_nav_detail: List[Tuple[Any, float, float, float]] = field(default_factory=list)  # [(date, nav, cash, invested)]
+
+    @property
+    def total_contributed(self) -> float:
+        return float(self.initial_capital) + sum(float(amt) for _, amt in self.contributions)
+
+    @property
+    def final_nav(self) -> float:
+        return float(self.daily_nav[-1][1]) if self.daily_nav else float(self.initial_capital)
 
     @property
     def completed_trades(self) -> List[Trade]:
@@ -195,28 +295,69 @@ class BacktestResult:
 
     @property
     def daily_returns(self) -> np.ndarray:
-        navs = np.array([nav for _, nav in self.daily_nav])
-        if len(navs) < 2:
+        """Daily time-weighted returns (start-of-day cash flow adjusted)."""
+        if len(self.daily_nav) < 2:
             return np.array([])
-        return np.diff(navs) / navs[:-1]
+        if not self.contributions:
+            navs = np.array([nav for _, nav in self.daily_nav], dtype=float)
+            return np.diff(navs) / navs[:-1]
+        contrib_by_date: Dict[pd.Timestamp, float] = {}
+        for dt, amt in self.contributions:
+            key = pd.Timestamp(dt).normalize()
+            contrib_by_date[key] = contrib_by_date.get(key, 0.0) + float(amt)
+        rets: List[float] = []
+        for idx in range(1, len(self.daily_nav)):
+            prev_nav = float(self.daily_nav[idx - 1][1])
+            cur_dt, cur_nav = self.daily_nav[idx]
+            cf = contrib_by_date.get(pd.Timestamp(cur_dt).normalize(), 0.0)
+            denom = prev_nav + cf
+            rets.append((float(cur_nav) / denom - 1.0) if denom > 0 else 0.0)
+        return np.array(rets, dtype=float)
+
+    @property
+    def twr_curve(self) -> np.ndarray:
+        """Cumulative time-weighted wealth index starting at 1.0."""
+        rets = self.daily_returns
+        if len(rets) == 0:
+            return np.array([1.0], dtype=float)
+        return np.concatenate(([1.0], np.cumprod(1.0 + rets)))
+
+    @property
+    def twr_total_return(self) -> float:
+        if len(self.daily_nav) < 2:
+            return 0.0
+        return float(self.twr_curve[-1] - 1.0)
+
+    @property
+    def twr_annualized_return(self) -> float:
+        if len(self.daily_nav) < 2:
+            return 0.0
+        total_days = (pd.Timestamp(self.daily_nav[-1][0]) - pd.Timestamp(self.daily_nav[0][0])).days
+        if total_days <= 0:
+            return 0.0
+        total_ret = self.twr_total_return
+        if total_ret <= -1.0:
+            return -1.0
+        return float((1.0 + total_ret) ** (365.0 / total_days) - 1.0)
+
+    @property
+    def xirr(self) -> Optional[float]:
+        """Annualized money-weighted return (XIRR) across initial capital and contributions."""
+        if len(self.daily_nav) < 2:
+            return None
+        flows: List[Tuple[Any, float]] = [(self.daily_nav[0][0], -float(self.initial_capital))]
+        for dt, amt in self.contributions:
+            flows.append((dt, -float(amt)))
+        flows.append((self.daily_nav[-1][0], self.final_nav))
+        return compute_xirr(flows)
 
     @property
     def total_return(self) -> float:
-        if len(self.daily_nav) < 2:
-            return 0.0
-        return self.daily_nav[-1][1] / self.daily_nav[0][1] - 1
+        return self.twr_total_return
 
     @property
     def annualized_return(self) -> float:
-        if len(self.daily_nav) < 2:
-            return 0.0
-        total_days = (self.daily_nav[-1][0] - self.daily_nav[0][0]).days
-        if total_days == 0:
-            return 0.0
-        total_ret = self.total_return
-        if total_ret <= -1:
-            return -1.0
-        return (1 + total_ret) ** (365 / total_days) - 1
+        return self.twr_annualized_return
 
     @property
     def volatility(self) -> float:
@@ -251,21 +392,21 @@ class BacktestResult:
 
     @property
     def max_drawdown(self) -> float:
-        navs = np.array([nav for _, nav in self.daily_nav])
-        if len(navs) < 2:
+        curve = self.twr_curve
+        if len(curve) < 2:
             return 0.0
-        running_max = np.maximum.accumulate(navs)
-        drawdowns = (navs - running_max) / running_max
+        running_max = np.maximum.accumulate(curve)
+        drawdowns = (curve - running_max) / running_max
         return float(np.min(drawdowns))
 
     @property
     def max_drawdown_duration(self) -> int:
         """Duration of longest drawdown in trading days."""
-        navs = np.array([nav for _, nav in self.daily_nav])
-        if len(navs) < 2:
+        curve = self.twr_curve
+        if len(curve) < 2:
             return 0
-        running_max = np.maximum.accumulate(navs)
-        in_drawdown = navs < running_max
+        running_max = np.maximum.accumulate(curve)
+        in_drawdown = curve < running_max
         max_dur = 0
         current_dur = 0
         for dd in in_drawdown:
@@ -354,16 +495,26 @@ class BacktestResult:
         return monthly.pct_change(fill_method=None).dropna()
 
     def summary(self) -> str:
-        final_nav = self.daily_nav[-1][1] if self.daily_nav else self.initial_capital
+        final_nav = self.final_nav
+        xirr_val = self.xirr
+        xirr_str = f"{xirr_val:>10.2%}" if xirr_val is not None else f"{'N/A':>10s}"
+        capital_line = (
+            f"Capital: NPR {self.initial_capital:,.0f} "
+            f"(Total Contributed: NPR {self.total_contributed:,.0f}, "
+            f"{len(self.contributions)} deposits)  ->  Final NAV: NPR {final_nav:,.0f}"
+            if self.contributions
+            else f"Capital: NPR {self.initial_capital:,.0f}  ->  Final NAV: NPR {final_nav:,.0f}"
+        )
         lines = [
             "=" * 70,
             f"BACKTEST RESULTS: {self.start_date.date()} to {self.end_date.date()}",
-            f"Capital: NPR {self.initial_capital:,.0f}  ->  Final NAV: NPR {final_nav:,.0f}",
+            capital_line,
             "=" * 70,
             "",
-            "PORTFOLIO METRICS (from daily NAV):",
-            f"  Total Return:        {self.total_return:>10.2%}",
-            f"  Annualized Return:   {self.annualized_return:>10.2%}",
+            "PORTFOLIO METRICS (TWR from daily NAV):",
+            f"  TWR Total Return:    {self.twr_total_return:>10.2%}",
+            f"  TWR Annualized:      {self.twr_annualized_return:>10.2%}",
+            f"  XIRR (MWR ann.):     {xirr_str}",
             f"  Volatility (ann.):   {self.volatility:>10.2%}",
             f"  Sharpe Ratio:        {self.sharpe_ratio:>10.2f}",
             f"  Sortino Ratio:       {self.sortino_ratio:>10.2f}",
@@ -2006,6 +2157,7 @@ def run_backtest(
     use_broker_exit: bool = False,
     progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     exclude_symbols: Optional[set[str]] = None,
+    monthly_contribution: float = 0.0,
 ) -> BacktestResult:
     """
     Run walk-forward portfolio backtest with realistic capital tracking.
@@ -2036,8 +2188,6 @@ def run_backtest(
     unavailable_signals = sorted(
         set(signal_types).intersection(
             {
-                "lead_lag",
-                "earnings_drift",
                 "informed_trading",
                 "broker_flow",
                 "smart_money",
@@ -2067,10 +2217,18 @@ def run_backtest(
 
     corp_actions_df = None
     quarterly_fundamental_model = None
-    if "corp_action" in signal_types or "settlement_pressure" in signal_types:
+    merger_symbols: set[str] = set()
+    earnings_df = None
+    if any(s in signal_types for s in ("corp_action", "settlement_pressure", "book_closure_runup", "ex_date_gap")):
         logger.info("Loading corporate actions...")
         corp_actions_df = load_corporate_actions(conn)
         logger.info(f"Loaded {len(corp_actions_df)} corporate actions")
+
+    if "ipo_momentum" in signal_types:
+        merger_symbols = load_merger_symbols(conn)
+
+    if "earnings_drift" in signal_types:
+        earnings_df = load_quarterly_earnings_df(conn)
 
     if "quarterly_fundamental" in signal_types:
         logger.info("Loading point-in-time quarterly fundamentals...")
@@ -2120,6 +2278,7 @@ def run_backtest(
 
     logger.info(f"Loaded {len(prices_df)} price records for {prices_df['symbol'].nunique()} symbols")
     symbol_cache = build_symbol_price_cache(prices_df)
+    sector_indices_df = build_synthetic_sector_indices(prices_df) if "sector_rotation" in signal_types else None
 
     # Generate trading dates
     all_dates = sorted(prices_df["date"].unique())
@@ -2147,12 +2306,20 @@ def run_backtest(
     prev_close_lookup = build_price_lookup(precompute_prev_close(prices_df), "prev_close")
     market_return_cache = build_market_return_cache(prices_df)
 
+    # Recurring BS-month deposits (initial_capital funds the starting month)
+    contribution_dates: set = set()
+    if monthly_contribution > 0 and trading_dates:
+        first_day = pd.Timestamp(trading_dates[0]).date()
+        contribution_dates = {d for d in bs_month_starts(trading_dates) if d > first_day}
+
     # Portfolio state
-    cash = initial_capital
+    cash = float(initial_capital)
     current_positions: Dict[str, Trade] = {}
     completed_trades: List[Trade] = []
     pending_entries: List[dict] = []  # Signals waiting for next-day execution
     daily_nav: List[Tuple[Any, float]] = []
+    daily_nav_detail: List[Tuple[Any, float, float, float]] = []
+    contributions: List[Tuple[Any, float]] = []
     last_signal_date = None
     current_regime = "neutral"  # Tracks last-known regime for STEP 1 use
 
@@ -2160,12 +2327,27 @@ def run_backtest(
     for i, current_date in enumerate(trading_dates):
         current_date = pd.Timestamp(current_date)
 
+        # ----- STEP 0: Apply scheduled BS month-start deposit before open -----
+        if contribution_dates and current_date.date() in contribution_dates:
+            cash += float(monthly_contribution)
+            contributions.append((current_date, float(monthly_contribution)))
+
         # ----- STEP 1: Execute pending entries at today's open -----
         for entry_info in pending_entries:
             symbol = entry_info["symbol"]
             if symbol in current_positions:
                 continue
-            if len(current_positions) >= max_positions:
+
+            nav_now = cash + sum(
+                t.shares * (
+                    open_lookup.get(t.symbol, {}).get(current_date)
+                    or prev_close_lookup.get(t.symbol, {}).get(current_date)
+                    or t.entry_price
+                )
+                for t in current_positions.values()
+            )
+            eff_max_pos = effective_max_positions_for_nav(nav_now, max_positions)
+            if len(current_positions) >= eff_max_pos:
                 break
 
             # Get today's open price for this symbol
@@ -2178,12 +2360,10 @@ def run_backtest(
             if prev_close is not None:
                 open_price = apply_circuit_breaker(open_price, prev_close)
 
-            # Position sizing: equal-weight
-            per_position = initial_capital / max_positions
-            # Don't exceed available cash
-            available = min(per_position, cash * 0.95)  # Keep 5% cash buffer
-            if available < 10000:  # Min NPR 10K position
-                continue
+            # Position sizing: equal-weight from current account value (NAV)
+            per_position = nav_now / eff_max_pos
+            # Don't exceed available cash (keep small buffer for fees/slippage)
+            available = min(per_position, cash * 0.98)
 
             if not (open_price > 0):  # re-check after circuit breaker (may produce NaN)
                 continue
@@ -2201,25 +2381,30 @@ def run_backtest(
                     continue
                 buy_fees = NepseFees.total_fees(shares, open_price)
                 total_cost = shares * open_price + buy_fees
+                if total_cost > cash:
+                    continue
 
             # Sector concentration check (regime-dependent if regime_sector_limits provided)
+            # Single-position small accounts cannot diversify across sectors; multi-position
+            # accounts ensure at least 1/eff_max_pos + 5% is allowed per sector.
             _eff_sector_limit = (
                 regime_sector_limits.get(current_regime, sector_limit)
                 if regime_sector_limits else sector_limit
             )
-            if _eff_sector_limit < 1.0:
+            if eff_max_pos > 1 and _eff_sector_limit < 1.0:
+                _eff_sector_limit = max(_eff_sector_limit, 1.0 / eff_max_pos + 0.05)
                 symbol_sector = get_symbol_sector(symbol)
                 if symbol_sector:
                     sector_value = sum(
-                        t.shares * (close_lookup.get(t.symbol, {}).get(current_date, t.entry_price))
+                        t.shares * (
+                            open_lookup.get(t.symbol, {}).get(current_date)
+                            or prev_close_lookup.get(t.symbol, {}).get(current_date)
+                            or t.entry_price
+                        )
                         for t in current_positions.values()
                         if get_symbol_sector(t.symbol) == symbol_sector
                     )
-                    nav_estimate = cash + sum(
-                        t.shares * close_lookup.get(t.symbol, {}).get(current_date, t.entry_price)
-                        for t in current_positions.values()
-                    )
-                    if nav_estimate > 0 and (sector_value + shares * open_price) / nav_estimate > _eff_sector_limit:
+                    if nav_now > 0 and (sector_value + shares * open_price) / nav_now > _eff_sector_limit:
                         continue
 
             cash -= total_cost
@@ -2333,14 +2518,16 @@ def run_backtest(
             del current_positions[symbol]
 
         # ----- STEP 3: Record end-of-day NAV -----
-        nav = cash
+        invested = 0.0
         for sym, trade in current_positions.items():
             # Use close price for MTM; fall back to entry price
             close_price = close_lookup.get(sym, {}).get(current_date)
             if close_price is None:
                 close_price = trade.entry_price
-            nav += trade.shares * close_price
+            invested += trade.shares * close_price
+        nav = cash + invested
         daily_nav.append((current_date, nav))
+        daily_nav_detail.append((current_date, nav, cash, invested))
 
         # ----- STEP 4: Generate signals -----
         if last_signal_date is None or (current_date - last_signal_date).days >= rebalance_frequency:
@@ -2380,6 +2567,9 @@ def run_backtest(
                 "satellite_hydro", "macro_remittance",
                 "nlp_sentiment", "quarterly_fundamental",
                 "value_bounce", "smart_money", "smart_money_pure",
+                "circuit_continuation", "sector_rotation",
+                "earnings_drift", "calendar_festival",
+                "nrb_policy", "lead_lag",
             ]):
                 liquid_symbols = compute_liquid_universe(
                     prices_df, current_date, symbol_cache=symbol_cache
@@ -2454,7 +2644,10 @@ def run_backtest(
                     prices_df, current_date, liquid_symbols=liquid_symbols
                 ))
 
-            # lead_lag signal: not included in public release
+            if "lead_lag" in signal_types:
+                all_signals.extend(generate_lead_lag_signals_at_date(
+                    prices_df, current_date, liquid_symbols=liquid_symbols, symbol_cache=symbol_cache
+                ))
 
             if "pairs_trade" in signal_types:
                 all_signals.extend(generate_pairs_signals_at_date(
@@ -2472,7 +2665,47 @@ def run_backtest(
                     prices_df, current_date, liquid_symbols=liquid_symbols
                 ))
 
-            # earnings_drift signal: not included in public release
+            if "earnings_drift" in signal_types and earnings_df is not None:
+                all_signals.extend(generate_earnings_drift_signals_at_date(
+                    prices_df, earnings_df, current_date,
+                    liquid_symbols=liquid_symbols, symbol_cache=symbol_cache,
+                ))
+
+            if "book_closure_runup" in signal_types and corp_actions_df is not None:
+                all_signals.extend(generate_book_closure_runup_signals_at_date(
+                    prices_df, corp_actions_df, current_date, symbol_cache=symbol_cache
+                ))
+
+            if "ex_date_gap" in signal_types and corp_actions_df is not None:
+                all_signals.extend(generate_ex_date_gap_signals_at_date(
+                    prices_df, corp_actions_df, current_date, symbol_cache=symbol_cache
+                ))
+
+            if "circuit_continuation" in signal_types:
+                all_signals.extend(generate_circuit_continuation_signals_at_date(
+                    prices_df, current_date, liquid_symbols=liquid_symbols, symbol_cache=symbol_cache
+                ))
+
+            if "ipo_momentum" in signal_types:
+                all_signals.extend(generate_ipo_momentum_signals_at_date(
+                    prices_df, current_date, merger_symbols=merger_symbols, symbol_cache=symbol_cache
+                ))
+
+            if "sector_rotation" in signal_types and sector_indices_df is not None:
+                all_signals.extend(generate_sector_rotation_signals_at_date(
+                    prices_df, current_date, sector_indices_df=sector_indices_df,
+                    liquid_symbols=liquid_symbols, symbol_cache=symbol_cache,
+                ))
+
+            if "calendar_festival" in signal_types:
+                all_signals.extend(generate_calendar_festival_signals_at_date(
+                    prices_df, current_date, liquid_symbols=liquid_symbols, symbol_cache=symbol_cache
+                ))
+
+            if "nrb_policy" in signal_types:
+                all_signals.extend(generate_nrb_policy_signals_at_date(
+                    prices_df, current_date, liquid_symbols=liquid_symbols, symbol_cache=symbol_cache
+                ))
 
             if "nlp_sentiment" in signal_types:
                 all_signals.extend(generate_sentiment_signals_at_date(
@@ -2517,6 +2750,14 @@ def run_backtest(
                 # neutral=1.2: boost in neutral where sector rotation is common
                 # bear=1.8: dominant signal in bear for contrarian plays
                 SignalType.VALUE_BOUNCE:       {"bull": 0.5, "neutral": 1.2, "bear": 1.8},
+                # NEPSE event / structural / calendar signals
+                SignalType.BOOK_CLOSURE_RUNUP:   {"bull": 1.0, "neutral": 1.1, "bear": 0.9},
+                SignalType.EX_DATE_GAP:          {"bull": 0.9, "neutral": 1.1, "bear": 1.2},
+                SignalType.CIRCUIT_CONTINUATION: {"bull": 1.2, "neutral": 0.9, "bear": 0.3},
+                SignalType.IPO_MOMENTUM:         {"bull": 1.2, "neutral": 0.9, "bear": 0.4},
+                SignalType.SECTOR_ROTATION:      {"bull": 1.1, "neutral": 1.0, "bear": 0.5},
+                SignalType.CALENDAR_FESTIVAL:    {"bull": 1.0, "neutral": 1.1, "bear": 0.9},
+                SignalType.NRB_POLICY:           {"bull": 1.1, "neutral": 1.1, "bear": 0.8},
             }
             if use_regime_filter and regime != "neutral":
                 for sig in all_signals:
@@ -2537,23 +2778,26 @@ def run_backtest(
                         sig.strength *= wt
 
             # Circuit-breaker reversal filter: skip stocks that hit +10% in last 3 days
-            # CB filter fires on +9.5% moves — extremely rare for quality/low_vol stocks
+            # Exempt signals that explicitly trade upper-circuit / IPO breakout continuation.
+            _CB_EXEMPT_SIGNALS = {SignalType.CIRCUIT_CONTINUATION, SignalType.IPO_MOMENTUM}
             all_signals = [
                 sig for sig in all_signals
-                if not is_circuit_breaker_hit(
+                if sig.signal_type in _CB_EXEMPT_SIGNALS
+                or not is_circuit_breaker_hit(
                     prices_df, sig.symbol, current_date, symbol_cache=symbol_cache
                 )
             ]
 
             # Queue top signals for next-day execution using the shared ranker.
-            effective_max = regime_pos_limit if regime_max_positions is not None else max_positions
-            slots_available = effective_max - len(current_positions)
-            queued = 0
-
             nav_estimate = cash + sum(
                 trade.shares * close_lookup.get(trade.symbol, {}).get(current_date, trade.entry_price)
                 for trade in current_positions.values()
             )
+            base_max = regime_pos_limit if regime_max_positions is not None else max_positions
+            effective_max = effective_max_positions_for_nav(nav_estimate, base_max)
+            slots_available = max(0, effective_max - len(current_positions))
+            queued = 0
+
             sector_exposure: Dict[str, float] = {}
             if nav_estimate > 0:
                 for trade in current_positions.values():
@@ -2588,6 +2832,10 @@ def run_backtest(
                     continue
                 if any(p["symbol"] == signal["symbol"] for p in pending_entries):
                     continue
+                if cash < 100_000:
+                    last_px = close_lookup.get(signal["symbol"], {}).get(current_date)
+                    if last_px is None or not (last_px > 0) or last_px * 10 * 1.02 > cash:
+                        continue
 
                 pending_entries.append({
                     "symbol": signal["symbol"],
@@ -2644,6 +2892,8 @@ def run_backtest(
         holding_period=holding_days,
         initial_capital=initial_capital,
         daily_nav=daily_nav,
+        contributions=contributions,
+        daily_nav_detail=daily_nav_detail,
     )
 
 
