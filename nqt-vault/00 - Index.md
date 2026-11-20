@@ -29,7 +29,10 @@ Keyboard-driven research and **paper-trading** terminal for the Nepal Stock Exch
 - [[Backend Layer]] — trading, agents, backtests, market, quant_pro
 - [[Native Floor Engine]] — optional Rust broker panels
 - [[Data and Config]] — market DB, strategy registry, runtime state
+- [[External Market Data Sources]] — bundled DB, Merolagani top-up, menaceXnadin cross-check
 - [[Validation Suite]] — walk-forward, Monte Carlo, CSCV/PBO
+- [[Baseline Backtest]] — C5 paper baseline methodology & status
+- [[Backtest Reports]] — dated backtest run tracker & reports
 
 ## Components
 

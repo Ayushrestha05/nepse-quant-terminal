@@ -2029,6 +2029,7 @@ def run_backtest(
     regime_sector_limits: Optional[Dict[str, float]] = None,
     use_broker_exit: bool = False,
     progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    exclude_symbols: Optional[set[str]] = None,
 ) -> BacktestResult:
     """
     Run walk-forward portfolio backtest with realistic capital tracking.
@@ -2077,6 +2078,16 @@ def run_backtest(
     logger.info("Loading price data...")
     conn = sqlite3.connect(str(get_db_path()))
     prices_df = load_all_prices(conn)
+    if exclude_symbols:
+        drop = {str(s).upper().strip() for s in exclude_symbols if str(s).strip()}
+        before = prices_df["symbol"].nunique()
+        prices_df = prices_df[~prices_df["symbol"].astype(str).str.upper().isin(drop)].copy()
+        logger.info(
+            "Excluded %d symbols from price universe (%d → %d)",
+            before - prices_df["symbol"].nunique(),
+            before,
+            prices_df["symbol"].nunique(),
+        )
 
     corp_actions_df = None
     quarterly_fundamental_model = None
