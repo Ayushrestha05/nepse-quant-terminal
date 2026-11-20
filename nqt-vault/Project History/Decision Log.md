@@ -30,3 +30,13 @@ Accepted ADRs are immutable; supersede with a new number.
   2. Standardize every backtest on three `CAPITAL_SCENARIOS`: `lump_10l` (NPR 10L), `lump_1l` (NPR 1L), and `sip_5k` (NPR 5K start + NPR 5K on the first trading day of each BS month via `nepdate-core`), reporting both TWR and XIRR. Enforced via `.cursor/rules/backtest-scenarios.mdc`.
   3. Persist all runs, trades, daily NAV (`nav`, `cash`, `invested`), and contributions into a dedicated, gitignored SQLite database `data/backtests.db` (`backend/backtesting/results_store.py`), skipping unchanged `(strategy_id, scenario, config_hash, data_end, window)` runs unless `--force` is passed.
 - **Consequences:** All historical baselines (including C5) are re-run under NAV sizing for comparability; legacy fixed-capital reports remain preserved as historical records in [[Backtest Reports]]. Every future strategy evaluation produces queryable trade ledgers across small and large retail Nepali accounts.
+
+## ADR-004 — Separate `data/floorsheet_raw.db` and HTTPS-only proxy-only scraping
+
+- **Status:** Accepted (2026-11-20)
+- **Context:** Multi-year NEPSE floorsheet history (2020–present) comprises tens of millions of trade rows (~8–10 GB with indexes), which would bloat `data/nepse_market_data.db` and slow down daily queries. At the same time, multi-day historical scraping of Merolagani and ShareSansar must not originate from the host IP or silently fall back to direct requests when proxies fail.
+- **Decision:**
+  1. Store all raw `floorsheet_trades` in a dedicated, gitignored SQLite file `data/floorsheet_raw.db` (`NEPSE_FLOORSHEET_RAW_DB`), preserving trade-level pairs and prices so new microstructure/broker features never require re-scraping.
+  2. Compute all four daily aggregate tables (`broker_summary`, `broker_signal_scores`, `broker_signals_v2`, `broker_microstructure`) into `data/nepse_market_data.db` during ingest; strategies (`informed_trading`) read only those aggregates.
+  3. Route all historical scrapers through a shared HTTPS-only proxy pool (`backend/quant_pro/data_scrapers/proxy_pool.py`), health-checked against `https://merolagani.com/` with TLS verification (`verify=True`). In proxy-only mode (`--proxy-only` / `NQT_PROXY_ONLY=1`), raise `ProxyPoolError` rather than falling back to the host IP, reject non-HTTPS targets, and discard malformed HTML/rows.
+- **Consequences:** Main DB stays compact and fast; raw floorsheet archives are preserved locally for future feature work; unattended backfills never leak the host IP. See [[Market Data Ingestion]], [[News Sentiment Pipeline]], [[External Market Data Sources]].

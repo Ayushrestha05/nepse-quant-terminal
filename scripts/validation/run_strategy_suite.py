@@ -61,6 +61,12 @@ SOLO_STRATEGY_IDS: List[str] = [
     "nepse_lead_lag",
 ]
 
+# Strategies gated on backfilled alt-data tables (table, date_col)
+DATA_GATED_SOLO_SPECS: Dict[str, Tuple[str, str]] = {
+    "nepse_informed_trading": ("broker_signals_v2", "as_of_date"),
+    "nepse_nlp_sentiment": ("sentiment_scores", "date"),
+}
+
 FIXED_COMBO_IDS: List[str] = [
     "combo_event_driven",
     "combo_trend",
@@ -93,10 +99,44 @@ ALLOWED_BT_KEYS = {
 def _db_max_date() -> str:
     conn = sqlite3.connect(str(get_db_path()))
     try:
-        row = conn.execute("SELECT MAX(date) FROM stock_prices").fetchone()
+        row = conn.execute(
+            "SELECT MAX(date) FROM stock_prices WHERE symbol != 'NEPSE' AND symbol NOT LIKE 'SECTOR::%'"
+        ).fetchone()
         return str(row[0])[:10]
     finally:
         conn.close()
+
+
+def _table_date_bounds(table: str, date_col: str) -> Optional[Tuple[str, str, int]]:
+    conn = sqlite3.connect(str(get_db_path()))
+    try:
+        row = conn.execute(
+            f"SELECT MIN({date_col}), MAX({date_col}), COUNT(*) FROM {table}"
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()
+    if not row or not row[0] or int(row[2] or 0) == 0:
+        return None
+    return str(row[0])[:10], str(row[1])[:10], int(row[2])
+
+
+def _active_data_gated_strategies(requested_start: str) -> List[Tuple[str, str, bool]]:
+    """Return [(strategy_id, effective_start, is_shortened_is)] for populated alt-data strategies."""
+    active: List[Tuple[str, str, bool]] = []
+    for sid, (table, col) in DATA_GATED_SOLO_SPECS.items():
+        bounds = _table_date_bounds(table, col)
+        if bounds is None:
+            print(f"  [WAIT] {sid:28s} skipped — {table} has 0 rows (waiting on backfill)")
+            continue
+        min_d, max_d, cnt = bounds
+        eff_start = max(requested_start, min_d)
+        shortened = eff_start > requested_start
+        note = f"SHORTENED IS ({eff_start}..{max_d})" if shortened else f"FULL ({eff_start}..{max_d})"
+        print(f"  [DATA] {sid:28s} {cnt:,} rows in {table} -> {note}")
+        active.append((sid, eff_start, shortened))
+    return active
 
 
 def _scenario_config(strategy_cfg: Dict[str, Any], scenario_key: str) -> Dict[str, Any]:
@@ -680,6 +720,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--force", action="store_true", help="Re-run even if matching run exists in data/backtests.db")
     parser.add_argument("--reports-only", action="store_true", help="Skip backtests and regenerate vault reports from DB")
     parser.add_argument("--run-stamp", default=None, help="Folder timestamp YYYY-MM-DD_HHMM (default: current local time)")
+    parser.add_argument("--only", nargs="+", default=None, help="Optional subset of strategy IDs to run (still all 3 scenarios)")
     args = parser.parse_args(argv)
 
     data_end = _db_max_date()
@@ -688,19 +729,31 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     print(f"NEPSE Strategy Suite | window {args.start} -> {end_date} | data_end={data_end} | workers={args.workers} | folder={run_stamp}")
 
+    active_gated = _active_data_gated_strategies(args.start)
+    gated_ids = [sid for sid, _, _ in active_gated]
+
     if not args.reports_only:
-        print("\n=== Phase 1: 9 Solo Strategies x 3 Capital Scenarios (27 runs) ===")
-        _execute_batch(SOLO_STRATEGY_IDS, args.start, end_date, data_end, args.workers, args.force)
+        if args.only:
+            print(f"\n=== Targeted Run ({len(args.only)} strategies x 3 Capital Scenarios) ===")
+            gated_start = {sid: eff for sid, eff, _ in active_gated}
+            for sid in args.only:
+                eff_s = gated_start.get(sid, args.start)
+                _execute_batch([sid], eff_s, end_date, data_end, args.workers, args.force)
+        else:
+            print("\n=== Phase 1: Solo Strategies x 3 Capital Scenarios ===")
+            _execute_batch(SOLO_STRATEGY_IDS, args.start, end_date, data_end, args.workers, args.force)
+            for sid, eff_s, _short in active_gated:
+                _execute_batch([sid], eff_s, end_date, data_end, args.workers, args.force)
 
-        print("\n=== Phase 2: Select Combinations from 2020-2024 In-Sample Sharpe ===")
-        _write_selected_combos(data_end)
+            print("\n=== Phase 2: Select Combinations from 2020-2024 In-Sample Sharpe ===")
+            _write_selected_combos(data_end)
 
-        print("\n=== Phase 3: 5 Combinations + C5 Baseline Re-Run x 3 Capital Scenarios (18 runs) ===")
-        phase3_ids = FIXED_COMBO_IDS + SELECTED_COMBO_IDS + ["default_c5"]
-        _execute_batch(phase3_ids, args.start, end_date, data_end, args.workers, args.force)
+            print("\n=== Phase 3: 5 Combinations + C5 Baseline Re-Run x 3 Capital Scenarios (18 runs) ===")
+            phase3_ids = FIXED_COMBO_IDS + SELECTED_COMBO_IDS + ["default_c5"]
+            _execute_batch(phase3_ids, args.start, end_date, data_end, args.workers, args.force)
 
     print("\n=== Phase 4: Generate Vault Reports & Account-Value Charts ===")
-    all_ids = ["default_c5"] + SOLO_STRATEGY_IDS + FIXED_COMBO_IDS + SELECTED_COMBO_IDS
+    all_ids = ["default_c5"] + SOLO_STRATEGY_IDS + gated_ids + FIXED_COMBO_IDS + SELECTED_COMBO_IDS
     per_run_paths, comp_path = generate_vault_reports(
         all_strategy_ids=all_ids,
         data_end=data_end,

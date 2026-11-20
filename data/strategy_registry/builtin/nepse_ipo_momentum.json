@@ -27,7 +27,7 @@
     "use_trailing_stop": true
   },
   "created_at": "2026-11-20T00:00:00",
-  "description": "Post-IPO listing discovery momentum (first trading day > 2017, excludes merger listings).",
+  "description": "Post-IPO listing discovery momentum using verified ShareSansar IPO-only listing dates (excludes FPOs, mutual funds, rights, and mergers; falls back to post-2017 proxy if table empty).",
   "editable": false,
   "execution_mode": "paper_runtime",
   "id": "nepse_ipo_momentum",

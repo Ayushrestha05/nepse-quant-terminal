@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sqlite3
 import sys
 from datetime import date, timedelta
@@ -23,7 +24,12 @@ if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
 from backend.quant_pro.database import get_db_connection, init_db  # noqa: E402
-from backend.quant_pro.floorsheet_scraper import ensure_floorsheet_tables, scrape_all  # noqa: E402
+from backend.quant_pro.floorsheet_scraper import (  # noqa: E402
+    ensure_floorsheet_tables,
+    get_raw_floorsheet_connection,
+    get_raw_floorsheet_db_path,
+    scrape_all,
+)
 
 LOG = logging.getLogger(__name__)
 
@@ -74,11 +80,10 @@ def show_summary() -> None:
     conn = get_db_connection()
     try:
         ensure_floorsheet_tables(conn)
-        total_trades, n_symbols, n_dates = conn.execute(
-            "SELECT COUNT(*), COUNT(DISTINCT symbol), COUNT(DISTINCT as_of_date) FROM floorsheet_trades"
-        ).fetchone()
-        min_date, max_date = conn.execute("SELECT MIN(as_of_date), MAX(as_of_date) FROM floorsheet_trades").fetchone()
         signal_rows = conn.execute("SELECT COUNT(*) FROM broker_signals_v2").fetchone()[0]
+        micro_rows = conn.execute("SELECT COUNT(*) FROM broker_microstructure").fetchone()[0]
+        logged_days = conn.execute("SELECT COUNT(*) FROM floorsheet_scrape_log").fetchone()[0]
+        agg_min, agg_max = conn.execute("SELECT MIN(as_of_date), MAX(as_of_date) FROM broker_signals_v2").fetchone()
         top_rows = conn.execute(
             """
             SELECT symbol, as_of_date, smart_money_score, circular_score, pump_score, n_trades
@@ -90,12 +95,27 @@ def show_summary() -> None:
     finally:
         conn.close()
 
+    raw_path = get_raw_floorsheet_db_path()
+    total_trades, n_symbols, n_dates, min_date, max_date = 0, 0, 0, None, None
+    if raw_path.exists():
+        rconn = get_raw_floorsheet_connection(raw_path)
+        try:
+            total_trades, n_symbols, n_dates = rconn.execute(
+                "SELECT COUNT(*), COUNT(DISTINCT symbol), COUNT(DISTINCT as_of_date) FROM floorsheet_trades"
+            ).fetchone()
+            min_date, max_date = rconn.execute(
+                "SELECT MIN(as_of_date), MAX(as_of_date) FROM floorsheet_trades"
+            ).fetchone()
+        finally:
+            rconn.close()
+
     print("FLOORSHEET / BROKER-FLOW SUMMARY")
+    print(f"  Raw DB:           {raw_path}")
     print(f"  Raw trades:       {int(total_trades or 0):,}")
     print(f"  Symbols covered:  {int(n_symbols or 0):,}")
-    print(f"  Trading days:     {int(n_dates or 0):,}")
-    print(f"  Date range:       {min_date or 'N/A'} -> {max_date or 'N/A'}")
-    print(f"  Broker signals:   {int(signal_rows or 0):,}")
+    print(f"  Trading days:     {int(n_dates or 0):,} (logged: {int(logged_days or 0):,})")
+    print(f"  Date range:       {min_date or agg_min or 'N/A'} -> {max_date or agg_max or 'N/A'}")
+    print(f"  Broker signals:   {int(signal_rows or 0):,} (microstructure: {int(micro_rows or 0):,})")
     if top_rows:
         print()
         print("  Latest broker signals:")
@@ -113,11 +133,18 @@ def main() -> None:
     parser.add_argument("--end", default=None, help="End date YYYY-MM-DD. Default is today.")
     parser.add_argument("--workers", type=int, default=4, help="Concurrent HTTP workers. Default: 4.")
     parser.add_argument("--rps", type=float, default=1.0, help="Approximate request rate per worker batch. Default: 1.0.")
+    parser.add_argument("--proxy-only", action="store_true", help="Route all scraping via free proxies only (never direct IP).")
+    parser.add_argument("--raw-db", default=None, help="Path to separate SQLite DB for raw floorsheet_trades.")
     parser.add_argument("--no-skip", action="store_true", help="Fetch even when symbol/date data already exists.")
     parser.add_argument("--dry-run", action="store_true", help="Fetch and parse without writing rows.")
     parser.add_argument("--summary", action="store_true", help="Show current DB summary and exit.")
     parser.add_argument("--create-tables", action="store_true", help="Create floorsheet tables and exit.")
     args = parser.parse_args()
+
+    if args.proxy_only:
+        os.environ["NQT_PROXY_ONLY"] = "1"
+    if args.raw_db:
+        os.environ["NEPSE_FLOORSHEET_RAW_DB"] = args.raw_db
 
     init_db()
     ensure_floorsheet_tables()
@@ -142,6 +169,8 @@ def main() -> None:
     print(f"  Symbols:    {len(symbols):,}")
     print(f"  Date range: {start_date} -> {end_date}")
     print(f"  Mode:       {'date-level' if args.date_level else 'symbol-level'}")
+    print(f"  Proxy-only: {args.proxy_only}")
+    print(f"  Raw DB:     {get_raw_floorsheet_db_path(args.raw_db)}")
     print(f"  Dry run:    {args.dry_run}")
 
     stats = scrape_all(
@@ -153,6 +182,7 @@ def main() -> None:
         skip_existing=not args.no_skip,
         dry_run=args.dry_run,
         mark_complete=args.date_level or args.all,
+        raw_db_path=args.raw_db,
     )
 
     print()

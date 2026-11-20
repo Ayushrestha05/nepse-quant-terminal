@@ -142,11 +142,8 @@ def _extract_symbols_from_text(text: str, known_symbols: set) -> List[str]:
 
 
 def _proxy_list() -> List[str]:
-    raw = (os.environ.get("NQT_PROXIES") or "").strip()
-    if not raw:
-        return []
-    # ponytail: free proxies are flaky and can tamper with traffic; rotate + skip failures only
-    return [p.strip() for p in raw.split(",") if p.strip()]
+    from backend.quant_pro.data_scrapers.proxy_pool import parse_proxy_env
+    return parse_proxy_env()
 
 
 def _default_headers() -> Dict[str, str]:
@@ -214,8 +211,20 @@ def _is_block_error(exc: BaseException) -> bool:
 
 # --- Scrapers ---
 
-def _fetch_url(url: str, timeout: int = 15) -> str:
-    """Fetch URL: direct urllib → NQT_PROXIES → optional Firecrawl."""
+def _fetch_url(url: str, timeout: int = 15, *, proxy_only: Optional[bool] = None) -> str:
+    """Fetch URL: shared HTTPS proxy pool in proxy-only mode; else direct → proxies → Firecrawl."""
+    from backend.quant_pro.data_scrapers.proxy_pool import (
+        ProxyPoolError,
+        get_proxy_pool,
+        is_proxy_only,
+    )
+
+    use_proxy_only = is_proxy_only() if proxy_only is None else bool(proxy_only)
+    if use_proxy_only:
+        pool = get_proxy_pool(proxy_only=True)
+        resp = pool.get(url, headers=_default_headers(), timeout=timeout)
+        return resp.content.decode("utf-8", errors="replace") if resp.status_code == 200 else ""
+
     try:
         return _fetch_via_urllib(url, timeout=timeout)
     except (URLError, HTTPError, TimeoutError) as e:
@@ -366,7 +375,7 @@ HF_MODELS = {
     "xlm-roberta": ("cardiffnlp/twitter-xlm-roberta-base-sentiment", "xlm-roberta-base-sentiment"),
 }
 
-AUTO_MODEL_ORDER = ("nepali-xlmr", "fin-qwen", "xlm-roberta")
+AUTO_MODEL_ORDER = ("xlm-roberta", "nepali-xlmr", "fin-qwen")
 
 
 def _load_hf_classifier(model_id: str, short_name: str):
@@ -689,6 +698,7 @@ def _parse_date(date_str: str) -> Optional[str]:
 
     formats = [
         "%b %d, %Y %I:%M %p",      # "Feb 13, 2026 05:55 PM"
+        "%b %d, %Y",                # "May 01, 2018"
         "%Y-%m-%d %H:%M:%S",        # "2026-02-13 17:55:00"
         "%Y-%m-%d",                  # "2026-02-13"
         "%d %b %Y",                  # "13 Feb 2026"
@@ -880,6 +890,285 @@ def run_sentiment_pipeline(
     return stored
 
 
+def parse_merolagani_news_detail(html: str, news_id: int) -> Optional[Dict[str, Any]]:
+    """Parse a Merolagani NewsDetail.aspx?newsID=<id> HTML page.
+
+    Returns an article dict or None if missing/malformed (e.g. deleted ID or
+    tampered proxy response).
+    """
+    if not html:
+        return None
+    title_match = re.search(
+        r'id="ctl00_ContentPlaceHolder1_newsTitle"[^>]*>(.*?)</',
+        html,
+        re.DOTALL | re.IGNORECASE,
+    )
+    date_match = re.search(
+        r'id="ctl00_ContentPlaceHolder1_newsDate"[^>]*>(.*?)</',
+        html,
+        re.DOTALL | re.IGNORECASE,
+    )
+    if not title_match or not date_match:
+        return None
+    title = unescape(re.sub(r"<[^>]+>", "", title_match.group(1))).strip()
+    date_str = unescape(re.sub(r"<[^>]+>", "", date_match.group(1))).strip()
+    published = _parse_date(date_str)
+    if not title or len(title) < 6 or not published:
+        return None
+
+    content = ""
+    body_match = re.search(
+        r'id="ctl00_ContentPlaceHolder1_newsDetail"[^>]*>(.*?)</div>',
+        html,
+        re.DOTALL | re.IGNORECASE,
+    )
+    if body_match:
+        content = unescape(re.sub(r"<[^>]+>", " ", body_match.group(1)))
+        content = re.sub(r"\s+", " ", content).strip()[:500]
+
+    return {
+        "news_id": int(news_id),
+        "title": title,
+        "url": f"https://merolagani.com/NewsDetail.aspx?newsID={int(news_id)}",
+        "date_str": date_str,
+        "published_at": published,
+        "content": content,
+        "source": "merolagani",
+    }
+
+
+def _max_stored_merolagani_news_id(db_path: str) -> Optional[int]:
+    try:
+        conn = sqlite3.connect(db_path, timeout=60)
+        try:
+            rows = conn.execute(
+                "SELECT url FROM news WHERE source = 'merolagani' AND url LIKE '%newsID=%'"
+            ).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None
+    best: Optional[int] = None
+    for (url,) in rows:
+        m = re.search(r"newsID=(\d+)", str(url or ""))
+        if m:
+            nid = int(m.group(1))
+            if best is None or nid > best:
+                best = nid
+    return best
+
+
+def _latest_merolagani_news_id(*, proxy_only: Optional[bool] = None) -> Optional[int]:
+    html = _fetch_url("https://merolagani.com/NewsList.aspx?page=1", proxy_only=proxy_only)
+    if not html:
+        return None
+    ids = [int(x) for x in re.findall(r"NewsDetail\.aspx\?newsID=(\d+)", html)]
+    return max(ids) if ids else None
+
+
+def _store_news_and_recompute_scores(
+    articles: List[Dict[str, Any]],
+    db_path: str,
+    known_symbols: set,
+    name_map: Dict[str, str],
+) -> Tuple[int, int]:
+    """Insert scored articles into ``news`` and recompute daily ``sentiment_scores``
+    from all stored ``news`` rows for the touched dates (safe across batches)."""
+    if not articles:
+        return 0, 0
+    now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    touched_dates: set[str] = set()
+    news_rows = []
+    model_used = articles[0].get("model_name", "keyword")
+    source_used = articles[0].get("source", "merolagani")
+
+    for a in articles:
+        pub = a.get("published_at") or _parse_date(a.get("date_str", ""))
+        if not pub:
+            continue
+        touched_dates.add(pub)
+        syms = _article_symbols(a, known_symbols, name_map)
+        primary_sym = syms[0] if syms else None
+        news_rows.append(
+            (
+                primary_sym,
+                pub,
+                a["title"],
+                a["url"],
+                a.get("source", "merolagani"),
+                round(float(a.get("sentiment_score", 0.0)), 4),
+                a.get("sentiment_label", "neutral"),
+                a.get("event_type", "general"),
+                a.get("content", ""),
+            )
+        )
+
+    if not news_rows:
+        return 0, 0
+
+    conn = sqlite3.connect(db_path, timeout=60)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=60000")
+    cur = conn.cursor()
+    before = conn.total_changes
+    cur.executemany(
+        """
+        INSERT OR IGNORE INTO news
+            (symbol, date, headline, url, source, sentiment_score, sentiment_label, category, content)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        news_rows,
+    )
+    inserted_news = conn.total_changes - before
+
+    # Recompute sentiment_scores across ALL stored news rows for touched dates
+    from collections import defaultdict
+
+    placeholders = ",".join("?" for _ in touched_dates)
+    stored_rows = cur.execute(
+        f"""
+        SELECT date, headline, sentiment_score, symbol
+        FROM news
+        WHERE source = ? AND date IN ({placeholders}) AND sentiment_score IS NOT NULL
+        """,
+        [source_used, *sorted(touched_dates)],
+    ).fetchall()
+
+    groups = defaultdict(list)
+    for pub_date, headline, s_score, primary_sym in stored_rows:
+        score_f = float(s_score)
+        groups[(pub_date, "")].append(score_f)
+        mentioned = _article_symbols({"title": headline or ""}, known_symbols, name_map)
+        if primary_sym and primary_sym not in mentioned:
+            mentioned.append(primary_sym)
+        for sym in mentioned:
+            groups[(pub_date, sym)].append(score_f)
+
+    agg_rows = []
+    for (pub_date, sym), scs in groups.items():
+        mean_s = sum(scs) / len(scs)
+        agg_rows.append(
+            (
+                pub_date,
+                sym if sym else None,
+                source_used,
+                model_used,
+                round(mean_s, 4),
+                round(min(1.0, abs(mean_s) + 0.5), 4),
+                len(scs),
+                now_utc,
+            )
+        )
+
+    cur.executemany(
+        """
+        INSERT OR REPLACE INTO sentiment_scores
+            (date, symbol, source, model, score, confidence, n_documents, scraped_at_utc)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        agg_rows,
+    )
+    conn.commit()
+    conn.close()
+    return inserted_news, len(agg_rows)
+
+
+def backfill_merolagani_news(
+    *,
+    start_id: int = 55000,
+    end_id: Optional[int] = None,
+    model: str = "xlm-roberta",
+    db_path: str = str(DEFAULT_DB_PATH),
+    batch_size: int = 64,
+    rps: float = 1.0,
+    proxy_only: Optional[bool] = None,
+    force: bool = False,
+) -> Dict[str, int]:
+    """Walk Merolagani NewsDetail.aspx?newsID=<id>, store all articles in ``news``,
+    and batch-score all articles with XLM-R into ``sentiment_scores``."""
+    from backend.quant_pro.database import init_db
+
+    init_db()
+    if model == "llm":
+        logger.warning("Backfill uses deterministic XLM-R, not LLM; switching model to auto")
+        model = "auto"
+
+    resume_from = int(start_id)
+    if not force:
+        max_stored = _max_stored_merolagani_news_id(db_path)
+        if max_stored is not None and max_stored >= resume_from:
+            resume_from = max_stored + 1
+            logger.info("Resuming Merolagani news backfill from newsID=%d (max stored=%d)", resume_from, max_stored)
+
+    if end_id is None:
+        detected = _latest_merolagani_news_id(proxy_only=proxy_only)
+        if detected is None:
+            raise RuntimeError("Could not detect latest Merolagani newsID; pass --end-id explicitly")
+        end_id = detected
+        logger.info("Detected latest Merolagani newsID=%d", end_id)
+
+    if resume_from > end_id:
+        logger.info("News backfill already up to date (resume_from=%d > end_id=%d)", resume_from, end_id)
+        return {"scanned": 0, "inserted": 0, "scores_updated": 0, "errors": 0}
+
+    known_symbols = _load_symbols_from_db(db_path)
+    name_map = _load_name_to_symbol(db_path)
+    classifier, model_name = _resolve_classifier(model)
+    if classifier is None:
+        model_name = "keyword"
+    logger.info(
+        "Backfilling Merolagani newsID %d..%d (model=%s, batch=%d, rps=%.2f)",
+        resume_from, end_id, model_name, batch_size, rps,
+    )
+
+    delay = 1.0 / max(float(rps or 1.0), 0.1)
+    stats = {"scanned": 0, "inserted": 0, "scores_updated": 0, "errors": 0}
+    buf: List[Dict[str, Any]] = []
+
+    def flush() -> None:
+        if not buf:
+            return
+        texts = [a["title"] for a in buf]
+        if classifier is not None:
+            scores = score_with_xlm_roberta(texts, classifier)
+        else:
+            scores = [score_with_keywords(t) for t in texts]
+        for a, s in zip(buf, scores):
+            a["sentiment_score"] = s["score"]
+            a["sentiment_confidence"] = s["confidence"]
+            a["sentiment_label"] = s["label"]
+            a["model_name"] = model_name
+        ins, upd = _store_news_and_recompute_scores(buf, db_path, known_symbols, name_map)
+        stats["inserted"] += ins
+        stats["scores_updated"] += upd
+        logger.info(
+            "Flushed batch up to newsID=%d (%s): +%d news, %d daily score rows",
+            buf[-1]["news_id"], buf[-1]["published_at"], ins, upd,
+        )
+        buf.clear()
+
+    for nid in range(resume_from, int(end_id) + 1):
+        stats["scanned"] += 1
+        url = f"https://merolagani.com/NewsDetail.aspx?newsID={nid}"
+        try:
+            html = _fetch_url(url, timeout=20, proxy_only=proxy_only)
+        except Exception as exc:
+            stats["errors"] += 1
+            logger.warning("newsID=%d fetch failed: %s", nid, exc)
+            time.sleep(delay)
+            continue
+
+        article = parse_merolagani_news_detail(html, nid)
+        if article is not None:
+            buf.append(article)
+            if len(buf) >= batch_size:
+                flush()
+        time.sleep(delay)
+
+    flush()
+    return stats
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Scrape NEPSE news and compute sentiment scores"
@@ -911,10 +1200,51 @@ def main():
         "--force", action="store_true",
         help="Re-scrape even when today's sentiment_scores already exist",
     )
+    parser.add_argument(
+        "--backfill", action="store_true",
+        help="Walk historical Merolagani newsIDs and backfill news + sentiment_scores",
+    )
+    parser.add_argument(
+        "--start-id", type=int, default=55000,
+        help="Starting Merolagani newsID for --backfill (default: 55000 ≈ early 2020)",
+    )
+    parser.add_argument(
+        "--end-id", type=int, default=None,
+        help="Ending Merolagani newsID for --backfill (default: auto-detect latest)",
+    )
+    parser.add_argument(
+        "--batch-size", type=int, default=64,
+        help="XLM-R scoring batch size for --backfill (default: 64)",
+    )
+    parser.add_argument(
+        "--rps", type=float, default=1.0,
+        help="Requests per second for --backfill (default: 1.0)",
+    )
+    parser.add_argument(
+        "--proxy-only", action="store_true",
+        help="Route all scraping via free proxies only (never direct IP)",
+    )
 
     args = parser.parse_args()
 
+    if args.proxy_only:
+        os.environ["NQT_PROXY_ONLY"] = "1"
+
     model = "keyword" if args.keyword_only else args.model
+
+    if args.backfill:
+        stats = backfill_merolagani_news(
+            start_id=args.start_id,
+            end_id=args.end_id,
+            model=model,
+            db_path=args.db,
+            batch_size=args.batch_size,
+            rps=args.rps,
+            proxy_only=True if args.proxy_only else None,
+            force=args.force,
+        )
+        print(f"\nBackfill done: {stats}")
+        return 0
 
     stored = run_sentiment_pipeline(
         pages=args.pages,

@@ -21,7 +21,7 @@ import logging
 import sqlite3
 from datetime import date as date_type
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import pandas as pd
@@ -383,14 +383,22 @@ def generate_ipo_momentum_signals_at_date(
     date: datetime,
     *,
     merger_symbols: Optional[Set[str]] = None,
+    ipo_listings: Optional[Dict[str, Dict[str, Any]]] = None,
     min_listing_year: int = 2018,
     min_trading_days: int = 5,
     max_trading_days: int = 45,
     symbol_cache: Optional[Dict[str, Tuple[pd.DataFrame, np.ndarray]]] = None,
 ) -> List[AlphaSignal]:
-    """Capture post-IPO listing discovery momentum (first trading day > 2017, non-merger)."""
+    """Capture post-IPO listing discovery momentum.
+
+    When ``ipo_listings`` (from ``ipo_listings`` SQLite table) is populated,
+    restricts to confirmed ``IPO`` rows (excluding FPOs, mutual funds, rights,
+    relistings) and anchors to the official ``listing_date`` when present.
+    Falls back to the post-2017 first-trading-day proxy when the table is empty.
+    """
     ts = pd.Timestamp(date)
     excluded = merger_symbols or set()
+    has_ipo_table = bool(ipo_listings)
     symbols = list(symbol_cache.keys()) if symbol_cache is not None else list(prices_df["symbol"].unique())
     signals: List[AlphaSignal] = []
 
@@ -398,13 +406,30 @@ def generate_ipo_momentum_signals_at_date(
         sym_u = str(symbol).upper().strip()
         if sym_u in excluded or not is_tradeable_signal_symbol(sym_u):
             continue
+
+        ipo_meta = ipo_listings.get(sym_u) if ipo_listings else None
+        if has_ipo_table:
+            if not ipo_meta or ipo_meta.get("issue_type") != "IPO":
+                continue
+
         hist = _history_slice(prices_df, symbol_cache, symbol, ts, tail=None)
         if hist is None:
             continue
+
+        official_ldate_str = ipo_meta.get("listing_date") if ipo_meta else None
+        if official_ldate_str:
+            anchor_dt = pd.Timestamp(official_ldate_str)
+            hist_post = hist[hist["date"] >= anchor_dt]
+            if hist_post.empty:
+                continue
+            hist = hist_post
+            first_dt = anchor_dt
+        else:
+            first_dt = pd.Timestamp(hist.iloc[0]["date"])
+
         n_days = len(hist)
         if n_days < min_trading_days or n_days > max_trading_days:
             continue
-        first_dt = pd.Timestamp(hist.iloc[0]["date"])
         if first_dt.year < min_listing_year:
             continue
         if not _is_fresh_row(hist, ts, max_stale_days=3):
@@ -426,14 +451,15 @@ def generate_ipo_momentum_signals_at_date(
             continue
 
         strength = min(1.0, 0.45 + min(0.35, ret_5d * 2.0) + min(0.20, max(0.0, 1.0 - n_days / max_trading_days) * 0.25))
+        tag = "official" if official_ldate_str else "proxy"
         signals.append(
             AlphaSignal(
                 symbol=symbol,
                 signal_type=SignalType.IPO_MOMENTUM,
                 direction=1,
                 strength=float(strength),
-                confidence=0.68,
-                reasoning=f"IPO day {n_days} (listed {first_dt.strftime('%Y-%m-%d')}): 5d +{ret_5d:.1%}",
+                confidence=0.72 if official_ldate_str else 0.68,
+                reasoning=f"IPO day {n_days} ({tag} listed {first_dt.strftime('%Y-%m-%d')}): 5d +{ret_5d:.1%}",
             )
         )
     return signals
@@ -828,3 +854,131 @@ def generate_lead_lag_signals_at_date(
                 )
             )
     return signals
+
+
+# =============================================================================
+# 10. BROKER CONCENTRATION / INFORMED TRADING (FLOORSHEET AGGREGATES)
+# =============================================================================
+
+def load_broker_flow_df(conn: sqlite3.Connection) -> pd.DataFrame:
+    """Load daily broker-flow aggregates (no raw floorsheet scan needed)."""
+    try:
+        df = pd.read_sql_query(
+            """
+            SELECT
+                v2.symbol,
+                v2.as_of_date AS date,
+                v2.hhi_buy_norm,
+                v2.hhi_sell_norm,
+                v2.circular_score,
+                v2.self_trade_pct,
+                v2.smart_money_score,
+                v2.pump_score,
+                v2.total_volume,
+                v2.n_trades,
+                COALESCE(bs.top5_net_share, 0.0) AS top5_net_share,
+                COALESCE(bs.accumulation_score, 0.0) AS accumulation_score,
+                COALESCE(bm.pin_proxy, 0.0) AS pin_proxy,
+                COALESCE(bm.micro_score, 0.0) AS micro_score,
+                COALESCE(bm.kyle_significant, 0) AS kyle_significant
+            FROM broker_signals_v2 v2
+            LEFT JOIN broker_signal_scores bs
+                ON bs.symbol = v2.symbol AND bs.as_of_date = v2.as_of_date
+            LEFT JOIN broker_microstructure bm
+                ON bm.symbol = v2.symbol AND bm.as_of_date = v2.as_of_date
+            ORDER BY v2.as_of_date ASC, v2.symbol ASC
+            """,
+            conn,
+        )
+    except Exception:
+        return pd.DataFrame()
+    if df.empty:
+        return df
+    df["date"] = pd.to_datetime(df["date"])
+    df["symbol"] = df["symbol"].astype(str).str.upper().str.strip()
+    return df
+
+
+def generate_informed_trading_signals_at_date(
+    prices_df: pd.DataFrame,
+    broker_flow_df: Optional[pd.DataFrame],
+    date: datetime,
+    *,
+    lookback_days: int = 5,
+    min_smart_money: float = 0.12,
+    liquid_symbols: Optional[Set[str]] = None,
+    symbol_cache: Optional[Dict[str, Tuple[pd.DataFrame, np.ndarray]]] = None,
+) -> List[AlphaSignal]:
+    """Emit causal informed-trading buy signals from prior-day broker concentration.
+
+    Strict no-lookahead: uses only ``as_of_date < date`` aggregates and filters
+    out circular / self-trade pump flags.
+    """
+    if broker_flow_df is None or broker_flow_df.empty:
+        return []
+    ts = pd.Timestamp(date)
+    start_ts = ts - pd.Timedelta(days=lookback_days)
+    window = broker_flow_df[(broker_flow_df["date"] >= start_ts) & (broker_flow_df["date"] < ts)]
+    if window.empty:
+        return []
+
+    signals: List[AlphaSignal] = []
+    for symbol, grp in window.groupby("symbol"):
+        sym_u = str(symbol).upper().strip()
+        if not is_tradeable_signal_symbol(sym_u):
+            continue
+        if liquid_symbols is not None and sym_u not in liquid_symbols:
+            continue
+
+        # Reject wash / circular / pump activity anywhere in the lookback window
+        if float(grp["pump_score"].max()) >= 0.05:
+            continue
+        if float(grp["self_trade_pct"].max()) >= 0.05:
+            continue
+        if float(grp["circular_score"].max()) >= 0.25:
+            continue
+
+        avg_smart = float(grp["smart_money_score"].mean())
+        avg_hhi_buy = float(grp["hhi_buy_norm"].mean())
+        avg_hhi_sell = float(grp["hhi_sell_norm"].mean())
+        avg_top5 = float(grp["top5_net_share"].mean())
+        avg_micro = float(grp["micro_score"].mean())
+        max_trades = int(grp["n_trades"].max())
+        max_vol = int(grp["total_volume"].max())
+
+        if max_trades < 20 or max_vol < 5000:
+            continue
+
+        concentrated_buy = (
+            avg_smart >= min_smart_money
+            or (avg_hhi_buy >= 0.22 and avg_hhi_sell <= 0.35 and avg_top5 >= 0.25)
+        )
+        if not concentrated_buy:
+            continue
+
+        hist = _history_slice(prices_df, symbol_cache, sym_u, ts, tail=5)
+        if hist is None or not _is_fresh_row(hist, ts, max_stale_days=3):
+            continue
+
+        strength = min(
+            1.0,
+            0.35 + 0.45 * min(1.0, avg_smart / 0.50) + 0.12 * min(1.0, avg_top5) + 0.08 * min(1.0, avg_micro),
+        )
+        confidence = min(0.85, 0.58 + 0.08 * min(3, len(grp)))
+        signals.append(
+            AlphaSignal(
+                symbol=sym_u,
+                signal_type=SignalType.INFORMED_TRADING,
+                direction=1,
+                strength=float(strength),
+                confidence=float(confidence),
+                reasoning=(
+                    f"Broker accumulation ({len(grp)}d): smart={avg_smart:.2f}, "
+                    f"hhi_buy={avg_hhi_buy:.2f}, top5={avg_top5:.0%}, micro={avg_micro:.2f}"
+                ),
+            )
+        )
+
+    signals.sort(key=lambda s: s.strength * s.confidence, reverse=True)
+    return signals
+

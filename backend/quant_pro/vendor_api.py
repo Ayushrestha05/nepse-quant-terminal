@@ -14,6 +14,7 @@ from requests.exceptions import HTTPError, RequestException, Timeout
 from tenacity import before_sleep_log, retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 import logging
 
+from .data_scrapers.proxy_pool import get_proxy_pool, is_proxy_only, parse_proxy_env
 from .realtime_market import get_market_data_provider
 
 
@@ -73,8 +74,22 @@ def fetch_ohlcv_chunk(symbol: str, start_ts: int, end_ts: int) -> pd.DataFrame:
         "Referer": f"https://merolagani.com/CompanyDetail.aspx?symbol={symbol}",
         "X-Requested-With": "XMLHttpRequest",
     }
-    response = requests.get(url, params=params, headers=headers, timeout=15)
-    response.raise_for_status()
+    req_kwargs = {"params": params, "headers": headers, "timeout": (5, 15)}
+    proxy_used: Optional[str] = None
+    pool = None
+    if is_proxy_only() or parse_proxy_env():
+        pool = get_proxy_pool()
+        proxy_used = pool.next_proxy()
+        if proxy_used:
+            req_kwargs["proxies"] = {"http": proxy_used, "https": proxy_used}
+            req_kwargs["verify"] = True
+    try:
+        response = requests.get(url, **req_kwargs)
+        response.raise_for_status()
+    except (RequestException, Timeout, HTTPError):
+        if pool is not None and proxy_used:
+            pool.mark_bad(proxy_used)
+        raise
     content_type = str(response.headers.get("content-type") or "").lower()
     if "html" in content_type:
         logger.warning(

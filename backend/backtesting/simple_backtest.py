@@ -60,13 +60,16 @@ from backend.backtesting.nepse_event_signals import (
     generate_circuit_continuation_signals_at_date,
     generate_earnings_drift_signals_at_date,
     generate_ex_date_gap_signals_at_date,
+    generate_informed_trading_signals_at_date,
     generate_ipo_momentum_signals_at_date,
     generate_lead_lag_signals_at_date,
     generate_nrb_policy_signals_at_date,
     generate_sector_rotation_signals_at_date,
+    load_broker_flow_df,
     load_merger_symbols,
     load_quarterly_earnings_df,
 )
+from backend.quant_pro.data_scrapers.ipo_ingestion import load_ipo_listing_map
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -2218,7 +2221,9 @@ def run_backtest(
     corp_actions_df = None
     quarterly_fundamental_model = None
     merger_symbols: set[str] = set()
+    ipo_listings: Dict[str, Any] = {}
     earnings_df = None
+    broker_flow_df = None
     if any(s in signal_types for s in ("corp_action", "settlement_pressure", "book_closure_runup", "ex_date_gap")):
         logger.info("Loading corporate actions...")
         corp_actions_df = load_corporate_actions(conn)
@@ -2226,9 +2231,14 @@ def run_backtest(
 
     if "ipo_momentum" in signal_types:
         merger_symbols = load_merger_symbols(conn)
+        ipo_listings = load_ipo_listing_map()
 
     if "earnings_drift" in signal_types:
         earnings_df = load_quarterly_earnings_df(conn)
+
+    if "informed_trading" in signal_types:
+        broker_flow_df = load_broker_flow_df(conn)
+        logger.info(f"Loaded {len(broker_flow_df)} broker-flow aggregate rows")
 
     if "quarterly_fundamental" in signal_types:
         logger.info("Loading point-in-time quarterly fundamentals...")
@@ -2688,7 +2698,8 @@ def run_backtest(
 
             if "ipo_momentum" in signal_types:
                 all_signals.extend(generate_ipo_momentum_signals_at_date(
-                    prices_df, current_date, merger_symbols=merger_symbols, symbol_cache=symbol_cache
+                    prices_df, current_date, merger_symbols=merger_symbols,
+                    ipo_listings=ipo_listings, symbol_cache=symbol_cache,
                 ))
 
             if "sector_rotation" in signal_types and sector_indices_df is not None:
@@ -2712,7 +2723,11 @@ def run_backtest(
                     prices_df, current_date, liquid_symbols=liquid_symbols
                 ))
 
-            # informed_trading / broker_flow signal: not included in public release
+            if "informed_trading" in signal_types and broker_flow_df is not None:
+                all_signals.extend(generate_informed_trading_signals_at_date(
+                    prices_df, broker_flow_df, current_date,
+                    liquid_symbols=liquid_symbols, symbol_cache=symbol_cache,
+                ))
 
             # Signal plugin: smart_money (not included in public release)
 

@@ -8,6 +8,8 @@ in ``backend.quant_pro.data_scrapers.floorsheet_ingestion``.
 from __future__ import annotations
 
 import logging
+import math
+import os
 import re
 import sqlite3
 import time
@@ -15,12 +17,15 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import date, datetime
-from typing import Iterable
+from pathlib import Path
+from typing import Iterable, Sequence
 
+import numpy as np
 import requests
 from bs4 import BeautifulSoup
 
-from backend.quant_pro.database import get_db_connection
+from backend.quant_pro.data_scrapers.proxy_pool import get_proxy_pool, is_proxy_only, parse_proxy_env
+from backend.quant_pro.database import get_db_connection, get_db_path
 
 LOG = logging.getLogger(__name__)
 
@@ -49,6 +54,47 @@ class FloorTrade:
     amount: float
     source_url: str
     scraped_at_utc: str
+
+
+def get_raw_floorsheet_db_path(raw_db_path: str | Path | None = None) -> Path:
+    """Path to the separate SQLite file holding raw floorsheet_trades rows."""
+    if raw_db_path:
+        return Path(raw_db_path)
+    env_path = (os.environ.get("NEPSE_FLOORSHEET_RAW_DB") or "").strip()
+    if env_path:
+        return Path(env_path)
+    return Path(get_db_path()).parent / "floorsheet_raw.db"
+
+
+def get_raw_floorsheet_connection(raw_db_path: str | Path | None = None) -> sqlite3.Connection:
+    """Open (and initialize) the separate raw floorsheet SQLite DB."""
+    path = get_raw_floorsheet_db_path(raw_db_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(path), timeout=60)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA busy_timeout=60000")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS floorsheet_trades (
+            transact_no TEXT PRIMARY KEY,
+            symbol TEXT NOT NULL,
+            as_of_date DATE NOT NULL,
+            buyer_broker INTEGER NOT NULL,
+            seller_broker INTEGER NOT NULL,
+            quantity INTEGER NOT NULL,
+            rate REAL NOT NULL,
+            amount REAL NOT NULL,
+            source_url TEXT,
+            scraped_at_utc TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_floorsheet_symbol_date ON floorsheet_trades(symbol, as_of_date)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_floorsheet_buyer ON floorsheet_trades(symbol, as_of_date, buyer_broker)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_floorsheet_seller ON floorsheet_trades(symbol, as_of_date, seller_broker)")
+    conn.commit()
+    return conn
 
 
 def ensure_floorsheet_tables(conn: sqlite3.Connection | None = None) -> None:
@@ -199,14 +245,33 @@ def _hidden_form(soup: BeautifulSoup) -> dict[str, str]:
     return data
 
 
+def _http_request(
+    session: requests.Session,
+    method: str,
+    url: str,
+    *,
+    timeout: float = 45,
+    **kwargs,
+) -> requests.Response:
+    """Send HTTP via ProxyPool when proxy-only or NQT_PROXIES is active."""
+    if is_proxy_only() or parse_proxy_env():
+        pool = get_proxy_pool()
+        resp = pool.request(method, url, session=session, timeout=timeout, **kwargs)
+    else:
+        resp = session.request(method, url, timeout=timeout, **kwargs)
+    resp.raise_for_status()
+    return resp
+
+
 def _symbol_ids(session: requests.Session) -> dict[str, str]:
-    response = session.post(
+    response = _http_request(
+        session,
+        "POST",
         AUTOSUGGEST_URL,
         data={"value": "", "sector": 0},
         headers={**HEADERS, "X-Requested-With": "XMLHttpRequest"},
         timeout=30,
     )
-    response.raise_for_status()
     out: dict[str, str] = {}
     for row in response.json():
         sym = str(row.get("d") or "").upper().strip()
@@ -229,16 +294,24 @@ def _parse_records(html: str, *, as_of_date: str, source_url: str) -> tuple[list
         if len(cells) < 8 or not cells[1].strip():
             continue
         try:
+            symbol = str(cells[2]).upper().strip()
+            buyer = _int(cells[3])
+            seller = _int(cells[4])
+            qty = _int(cells[5])
+            rate = _money(cells[6])
+            amount = _money(cells[7])
+            if not symbol or buyer <= 0 or seller <= 0 or qty <= 0 or rate <= 0:
+                continue
             trades.append(
                 FloorTrade(
                     transact_no=str(cells[1]),
-                    symbol=str(cells[2]).upper().strip(),
+                    symbol=symbol,
                     as_of_date=as_of_date,
-                    buyer_broker=_int(cells[3]),
-                    seller_broker=_int(cells[4]),
-                    quantity=_int(cells[5]),
-                    rate=_money(cells[6]),
-                    amount=_money(cells[7]),
+                    buyer_broker=buyer,
+                    seller_broker=seller,
+                    quantity=qty,
+                    rate=rate,
+                    amount=amount,
                     source_url=source_url,
                     scraped_at_utc=scraped_at,
                 )
@@ -262,8 +335,7 @@ def _search_page(
     symbol_id: str,
     target_date: date | str,
 ) -> tuple[str, str]:
-    first = session.get(BASE_URL, headers=HEADERS, timeout=30)
-    first.raise_for_status()
+    first = _http_request(session, "GET", BASE_URL, headers=HEADERS, timeout=30)
     data = _hidden_form(BeautifulSoup(first.text, "html.parser"))
     data["__EVENTTARGET"] = "ctl00$ContentPlaceHolder1$lbtnSearchFloorsheet"
     data["ctl00$ContentPlaceHolder1$ASCompanyFilter$hdnAutoSuggest"] = str(symbol_id)
@@ -271,19 +343,19 @@ def _search_page(
     data["ctl00$ContentPlaceHolder1$txtBuyerBrokerCodeFilter"] = ""
     data["ctl00$ContentPlaceHolder1$txtSellerBrokerCodeFilter"] = ""
     data["ctl00$ContentPlaceHolder1$txtFloorsheetDateFilter"] = _date_for_form(target_date)
-    response = session.post(
+    response = _http_request(
+        session,
+        "POST",
         BASE_URL,
         data=data,
         headers={**HEADERS, "Referer": BASE_URL, "Origin": "https://merolagani.com"},
         timeout=45,
     )
-    response.raise_for_status()
     return response.text, BASE_URL
 
 
 def _search_date_page(session: requests.Session, *, target_date: date | str) -> tuple[str, str]:
-    first = session.get(BASE_URL, headers=HEADERS, timeout=30)
-    first.raise_for_status()
+    first = _http_request(session, "GET", BASE_URL, headers=HEADERS, timeout=30)
     data = _hidden_form(BeautifulSoup(first.text, "html.parser"))
     data["__EVENTTARGET"] = "ctl00$ContentPlaceHolder1$lbtnSearchFloorsheet"
     data["ctl00$ContentPlaceHolder1$ASCompanyFilter$hdnAutoSuggest"] = ""
@@ -291,13 +363,14 @@ def _search_date_page(session: requests.Session, *, target_date: date | str) -> 
     data["ctl00$ContentPlaceHolder1$txtBuyerBrokerCodeFilter"] = ""
     data["ctl00$ContentPlaceHolder1$txtSellerBrokerCodeFilter"] = ""
     data["ctl00$ContentPlaceHolder1$txtFloorsheetDateFilter"] = _date_for_form(target_date)
-    response = session.post(
+    response = _http_request(
+        session,
+        "POST",
         BASE_URL,
         data=data,
         headers={**HEADERS, "Referer": BASE_URL, "Origin": "https://merolagani.com"},
         timeout=45,
     )
-    response.raise_for_status()
     return response.text, BASE_URL
 
 
@@ -305,13 +378,14 @@ def _page(session: requests.Session, html: str, page_no: int) -> str:
     data = _hidden_form(BeautifulSoup(html, "html.parser"))
     data["ctl00$ContentPlaceHolder1$PagerControl1$hdnCurrentPage"] = str(page_no)
     data["ctl00$ContentPlaceHolder1$PagerControl1$btnPaging"] = ""
-    response = session.post(
+    response = _http_request(
+        session,
+        "POST",
         BASE_URL,
         data=data,
         headers={**HEADERS, "Referer": BASE_URL, "Origin": "https://merolagani.com"},
         timeout=45,
     )
-    response.raise_for_status()
     return response.text
 
 
@@ -493,16 +567,148 @@ def _compute_signal_metrics(
     }
 
 
-def _recompute_aggregates(conn: sqlite3.Connection, symbol: str, as_of_date: str) -> None:
-    conn.row_factory = sqlite3.Row
-    raw_rows = conn.execute(
-        """
-        SELECT buyer_broker, seller_broker, quantity, amount
-        FROM floorsheet_trades
-        WHERE symbol = ? AND as_of_date = ?
-        """,
-        (symbol.upper(), as_of_date),
-    ).fetchall()
+def _compute_microstructure_metrics(raw_rows: Sequence[dict]) -> dict[str, float | int]:
+    """Compute intraday microstructure metrics from trade-level rates and quantities."""
+    n = len(raw_rows)
+    if n < 2:
+        return {
+            "amihud_illiq": 0.0,
+            "roll_spread": 0.0,
+            "cs_spread": 0.0,
+            "kyle_lambda": 0.0,
+            "kyle_pvalue": 1.0,
+            "kyle_rsq": 0.0,
+            "kyle_cwoib": 0.0,
+            "kyle_significant": 0,
+            "pin_proxy": 0.0,
+            "micro_score": 0.0,
+        }
+
+    rates = np.array([float(r["rate"] or 0.0) for r in raw_rows], dtype=np.float64)
+    qtys = np.array([float(r["quantity"] or 0.0) for r in raw_rows], dtype=np.float64)
+    amts = np.array([float(r["amount"] or 0.0) for r in raw_rows], dtype=np.float64)
+    valid = (rates > 0) & (qtys > 0)
+    rates, qtys, amts = rates[valid], qtys[valid], amts[valid]
+    if len(rates) < 2:
+        return {
+            "amihud_illiq": 0.0,
+            "roll_spread": 0.0,
+            "cs_spread": 0.0,
+            "kyle_lambda": 0.0,
+            "kyle_pvalue": 1.0,
+            "kyle_rsq": 0.0,
+            "kyle_cwoib": 0.0,
+            "kyle_significant": 0,
+            "pin_proxy": 0.0,
+            "micro_score": 0.0,
+        }
+
+    total_amt = float(np.sum(amts))
+    mean_rate = float(np.mean(rates))
+    day_ret = abs((rates[-1] - rates[0]) / max(rates[0], 1e-9))
+    amihud_illiq = float(day_ret / max(total_amt / 1e6, 1e-6))
+
+    hi, lo = float(np.max(rates)), float(np.min(rates))
+    cs_spread = float((hi - lo) / max((hi + lo) * 0.5, 1e-9))
+
+    dp = np.diff(rates)
+    if len(dp) >= 2:
+        cov = float(np.cov(dp[1:], dp[:-1])[0, 1])
+        roll_spread = float(2.0 * math.sqrt(max(0.0, -cov)) / max(mean_rate, 1e-9))
+    else:
+        roll_spread = 0.0
+
+    # Tick-rule trade direction (+1 uptick, -1 downtick, carry last sign on 0)
+    signs = np.zeros(len(dp), dtype=np.float64)
+    last_s = 1.0
+    for i, d in enumerate(dp):
+        if d > 0:
+            last_s = 1.0
+        elif d < 0:
+            last_s = -1.0
+        signs[i] = last_s
+
+    signed_vol = signs * qtys[1:]
+    buy_init = float(np.sum(qtys[1:][signs > 0]))
+    sell_init = float(np.sum(qtys[1:][signs < 0]))
+    tot_v = float(np.sum(qtys[1:]))
+    pin_proxy = float(abs(buy_init - sell_init) / max(tot_v, 1e-9))
+    kyle_cwoib = float((buy_init - sell_init) / max(tot_v, 1e-9))
+
+    # OLS: dp = a + kyle_lambda * signed_vol
+    kyle_lambda = 0.0
+    kyle_rsq = 0.0
+    kyle_pvalue = 1.0
+    kyle_sig = 0
+    if len(dp) >= 10:
+        x = signed_vol
+        y = dp
+        x_mean = float(np.mean(x))
+        y_mean = float(np.mean(y))
+        dx = x - x_mean
+        dy = y - y_mean
+        sxx = float(np.dot(dx, dx))
+        syy = float(np.dot(dy, dy))
+        if sxx > 1e-12 and syy > 1e-12:
+            sxy = float(np.dot(dx, dy))
+            kyle_lambda = sxy / sxx
+            yhat = y_mean + kyle_lambda * dx
+            resid = y - yhat
+            sse = float(np.dot(resid, resid))
+            kyle_rsq = max(0.0, min(1.0, 1.0 - sse / syy))
+            dof = len(dp) - 2
+            se = math.sqrt(max(sse / max(dof, 1), 0.0) / sxx)
+            t_stat = abs(kyle_lambda / se) if se > 1e-12 else 0.0
+            # Normal approx two-sided p-value (ponytail: avoids scipy dep for dof >= 8)
+            kyle_pvalue = float(math.erfc(t_stat / math.sqrt(2.0)))
+            kyle_sig = 1 if (kyle_lambda > 0 and kyle_pvalue < 0.05) else 0
+
+    micro_score = max(
+        0.0,
+        min(1.0, 0.5 * pin_proxy + 0.3 * kyle_rsq + (0.2 if kyle_sig else 0.0)),
+    )
+    return {
+        "amihud_illiq": round(amihud_illiq, 6),
+        "roll_spread": round(roll_spread, 6),
+        "cs_spread": round(cs_spread, 6),
+        "kyle_lambda": round(kyle_lambda, 8),
+        "kyle_pvalue": round(kyle_pvalue, 6),
+        "kyle_rsq": round(kyle_rsq, 6),
+        "kyle_cwoib": round(kyle_cwoib, 6),
+        "kyle_significant": int(kyle_sig),
+        "pin_proxy": round(pin_proxy, 6),
+        "micro_score": round(micro_score, 6),
+    }
+
+
+def _recompute_aggregates(
+    conn: sqlite3.Connection,
+    symbol: str,
+    as_of_date: str,
+    raw_trades: Sequence[FloorTrade] | None = None,
+) -> None:
+    if raw_trades is not None:
+        raw_rows = [
+            {
+                "buyer_broker": t.buyer_broker,
+                "seller_broker": t.seller_broker,
+                "quantity": t.quantity,
+                "rate": t.rate,
+                "amount": t.amount,
+            }
+            for t in raw_trades
+        ]
+    else:
+        conn.row_factory = sqlite3.Row
+        raw_rows = conn.execute(
+            """
+            SELECT buyer_broker, seller_broker, quantity, rate, amount
+            FROM floorsheet_trades
+            WHERE symbol = ? AND as_of_date = ?
+            ORDER BY transact_no ASC
+            """,
+            (symbol.upper(), as_of_date),
+        ).fetchall()
     if not raw_rows:
         return
 
@@ -606,6 +812,31 @@ def _recompute_aggregates(conn: sqlite3.Connection, symbol: str, as_of_date: str
         ),
     )
 
+    micro = _compute_microstructure_metrics(raw_rows)
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO broker_microstructure
+        (symbol, as_of_date, amihud_illiq, roll_spread, cs_spread,
+         kyle_lambda, kyle_pvalue, kyle_rsq, kyle_cwoib, kyle_significant,
+         pin_proxy, micro_score)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            symbol.upper(),
+            as_of_date,
+            micro["amihud_illiq"],
+            micro["roll_spread"],
+            micro["cs_spread"],
+            micro["kyle_lambda"],
+            micro["kyle_pvalue"],
+            micro["kyle_rsq"],
+            micro["kyle_cwoib"],
+            micro["kyle_significant"],
+            micro["pin_proxy"],
+            micro["micro_score"],
+        ),
+    )
+
 
 def _date_range(start_date: date | str, end_date: date | str) -> list[date]:
     start = date.fromisoformat(str(start_date)) if not isinstance(start_date, date) else start_date
@@ -619,6 +850,26 @@ def _date_range(start_date: date | str, end_date: date | str) -> list[date]:
 
 
 def _trading_dates(start_date: date | str, end_date: date | str) -> list[date]:
+    start_s = _date_key(start_date)
+    end_s = _date_key(end_date)
+    try:
+        conn = get_db_connection()
+        try:
+            rows = conn.execute(
+                """
+                SELECT DISTINCT substr(date, 1, 10) AS d
+                FROM stock_prices
+                WHERE substr(date, 1, 10) BETWEEN ? AND ?
+                ORDER BY d ASC
+                """,
+                (start_s, end_s),
+            ).fetchall()
+        finally:
+            conn.close()
+        if rows:
+            return [date.fromisoformat(str(r[0])) for r in rows if r and r[0]]
+    except Exception:
+        pass
     try:
         from backend.quant_pro.nepse_calendar import is_trading_day
 
@@ -637,11 +888,13 @@ def scrape_all(
     skip_existing: bool = True,
     dry_run: bool = False,
     mark_complete: bool = False,
+    raw_db_path: str | Path | None = None,
 ) -> dict[str, int]:
-    """Scrape floorsheet data and recompute broker-flow tables.
+    """Scrape floorsheet data and recompute all 4 broker-flow aggregate tables.
 
-    When ``mark_complete`` is true, the scraper fetches the whole market by
-    date instead of looping per symbol. This is usually faster for daily runs.
+    Raw trades are stored in ``data/floorsheet_raw.db`` (separate SQLite file)
+    while ``broker_summary``, ``broker_signal_scores``, ``broker_signals_v2``,
+    ``broker_microstructure`` and ``floorsheet_scrape_log`` live in the main DB.
     """
     ensure_floorsheet_tables()
     dates = _trading_dates(start_date, end_date)
@@ -662,7 +915,7 @@ def scrape_all(
         finally:
             conn.close()
 
-        for day in dates:
+        for idx, day in enumerate(dates, 1):
             day_key = day.isoformat()
             if skip_existing and day_key in done_dates:
                 stats["skipped"] += 1
@@ -677,18 +930,22 @@ def scrape_all(
             stats["fetched"] += 1
             if dry_run:
                 continue
+
+            raw_conn = get_raw_floorsheet_connection(raw_db_path)
+            try:
+                inserted = _insert_trades(raw_conn, trades)
+                raw_conn.commit()
+            finally:
+                raw_conn.close()
+
+            by_symbol: dict[str, list[FloorTrade]] = defaultdict(list)
+            for t in trades:
+                by_symbol[t.symbol].append(t)
+
             conn = get_db_connection()
             try:
-                inserted = _insert_trades(conn, trades)
-                symbols_today = [
-                    row[0]
-                    for row in conn.execute(
-                        "SELECT DISTINCT symbol FROM floorsheet_trades WHERE as_of_date = ?",
-                        (day_key,),
-                    ).fetchall()
-                ]
-                for sym in symbols_today:
-                    _recompute_aggregates(conn, sym, day_key)
+                for sym, sym_trades in by_symbol.items():
+                    _recompute_aggregates(conn, sym, day_key, raw_trades=sym_trades)
                 conn.execute(
                     """
                     INSERT OR REPLACE INTO floorsheet_scrape_log
@@ -699,6 +956,10 @@ def scrape_all(
                 )
                 conn.commit()
                 stats["inserted"] += inserted
+                LOG.info(
+                    "[%d/%d] %s: %d trades (%d new), %d symbols, %d pages",
+                    idx, len(dates), day_key, len(trades), inserted, len(by_symbol), int(total_pages or 0),
+                )
             finally:
                 conn.close()
         return stats
@@ -708,16 +969,16 @@ def scrape_all(
     pairs = [(sym.upper(), day) for day in dates for sym in symbols if sym.upper() in symbol_ids]
     stats["total_pairs"] = len(pairs)
 
-    conn = get_db_connection()
+    raw_conn = get_raw_floorsheet_connection(raw_db_path)
     try:
         todo: list[tuple[str, date]] = []
         for sym, day in pairs:
-            if skip_existing and _existing(conn, sym, day.isoformat()):
+            if skip_existing and _existing(raw_conn, sym, day.isoformat()):
                 stats["skipped"] += 1
             else:
                 todo.append((sym, day))
     finally:
-        conn.close()
+        raw_conn.close()
 
     def worker(pair: tuple[str, date]) -> tuple[str, str, list[FloorTrade], str | None]:
         sym, day = pair
@@ -738,10 +999,15 @@ def scrape_all(
             stats["fetched"] += 1
             if dry_run:
                 continue
+            raw_conn = get_raw_floorsheet_connection(raw_db_path)
+            try:
+                inserted = _insert_trades(raw_conn, trades)
+                raw_conn.commit()
+            finally:
+                raw_conn.close()
             conn = get_db_connection()
             try:
-                inserted = _insert_trades(conn, trades)
-                _recompute_aggregates(conn, sym, day_key)
+                _recompute_aggregates(conn, sym, day_key, raw_trades=trades)
                 conn.commit()
                 stats["inserted"] += inserted
             finally:

@@ -91,8 +91,11 @@ def load_symbols() -> list[str]:
     if ALL_SYMBOLS_FILE.exists():
         from backend.quant_pro.signal_ranking import is_tradeable_signal_symbol
         syms = [s.strip() for s in ALL_SYMBOLS_FILE.read_text().splitlines() if s.strip()]
-        return [s for s in syms if is_tradeable_signal_symbol(s)]
-    return []
+        filtered = [s for s in syms if is_tradeable_signal_symbol(s)]
+        if "NEPSE" not in filtered:
+            filtered.append("NEPSE")
+        return filtered
+    return ["NEPSE"]
 
 
 def ts(dt: datetime) -> int:
@@ -147,17 +150,103 @@ def scrape_db(days: int, symbol: str | None):
     print(f"\nDone — {total:,} rows written to {get_db_path()}")
 
 
+def backfill_indices(start_date: str = "2020-01-01", *, force: bool = False) -> int:
+    """Backfill NEPSE and all sector sub-indices into benchmark_index_history (and NEPSE into stock_prices)."""
+    from backend.quant_pro.data_io import SECTOR_INDEX_SYMBOLS
+    from backend.quant_pro.database import get_db_connection, get_db_path, init_db, save_benchmark_history
+    from backend.quant_pro.vendor_api import fetch_ohlcv_chunk
+
+    init_db()
+    benchmarks = sorted(set(SECTOR_INDEX_SYMBOLS.values()))
+    today_dt = datetime.now()
+    today_str = today_dt.strftime("%Y-%m-%d")
+    total_written = 0
+
+    conn = get_db_connection()
+    try:
+        coverage = {
+            row[0]: (row[1], row[2], int(row[3] or 0))
+            for row in conn.execute(
+                "SELECT benchmark, MIN(date), MAX(date), COUNT(*) FROM benchmark_index_history GROUP BY benchmark"
+            ).fetchall()
+        }
+        nepse_px_max = conn.execute(
+            "SELECT MAX(date) FROM stock_prices WHERE symbol = 'NEPSE'"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+    print(f"Backfilling {len(benchmarks)} indices ({start_date} -> {today_str}) into {get_db_path()}")
+    for i, sym in enumerate(benchmarks, 1):
+        min_d, max_d, cnt = coverage.get(sym, (None, None, 0))
+        if not force and min_d and max_d and min_d <= start_date[:7] + "-31" and max_d >= today_str:
+            print(f"[{i:2d}/{len(benchmarks)}] {sym:<20} skip (have {cnt} rows: {min_d}..{max_d})")
+            continue
+        if not force and min_d and max_d and min_d <= start_date[:7] + "-31":
+            fetch_start = datetime.strptime(max_d[:10], "%Y-%m-%d") + timedelta(days=1)
+        else:
+            fetch_start = datetime.strptime(start_date, "%Y-%m-%d")
+
+        if fetch_start.date() > today_dt.date():
+            print(f"[{i:2d}/{len(benchmarks)}] {sym:<20} up-to-date ({min_d}..{max_d})")
+            continue
+
+        try:
+            df = fetch_ohlcv_chunk(sym, ts(fetch_start), ts(today_dt))
+            if df is None or df.empty:
+                print(f"[{i:2d}/{len(benchmarks)}] {sym:<20}     0 rows (no data)")
+                continue
+            written = save_benchmark_history(sym, df.to_dict("records"), source="merolagani_chart")
+            total_written += written
+            dmin = df["Date"].min().strftime("%Y-%m-%d")
+            dmax = df["Date"].max().strftime("%Y-%m-%d")
+            print(f"[{i:2d}/{len(benchmarks)}] {sym:<20} {written:>5} rows ({dmin}..{dmax})")
+        except Exception as e:
+            print(f"[{i:2d}/{len(benchmarks)}] {sym:<20} WARN: {e}")
+
+    # Also top up NEPSE in stock_prices past its stored max date
+    if force or not nepse_px_max or str(nepse_px_max)[:10] < today_str:
+        px_start = (
+            datetime.strptime(str(nepse_px_max)[:10], "%Y-%m-%d") - timedelta(days=7)
+            if (nepse_px_max and not force)
+            else datetime.strptime(start_date, "%Y-%m-%d")
+        )
+        rows = backfill_symbol("NEPSE", px_start, today_dt)
+        print(f"stock_prices NEPSE top-up ({px_start.date()} -> {today_dt.date()}): {rows} rows")
+        total_written += rows
+
+    print(f"Done — {total_written:,} index rows written.")
+    return total_written
+
+
 # ── main ──────────────────────────────────────────────────────────────────────
 
 def main():
+    import os
+
     parser = argparse.ArgumentParser(description="NEPSE Quant — data setup")
     parser.add_argument("--scrape", action="store_true",
                         help="Scrape fresh data from Merolagani instead of downloading")
+    parser.add_argument("--indices", action="store_true",
+                        help="Backfill NEPSE and all sector sub-indices into benchmark_index_history")
+    parser.add_argument("--start", type=str, default="2020-01-01",
+                        help="Start date YYYY-MM-DD for --indices (default: 2020-01-01)")
+    parser.add_argument("--force", action="store_true",
+                        help="Re-fetch indices even if already present")
+    parser.add_argument("--proxy-only", action="store_true",
+                        help="Route scraping through free proxies only (never direct IP)")
     parser.add_argument("--days", type=int, default=760,
                         help="Days of history to scrape (default 760 ≈ 2 yr). Only used with --scrape.")
     parser.add_argument("--symbol", type=str, default=None,
                         help="Single symbol to scrape. Only used with --scrape.")
     args = parser.parse_args()
+
+    if args.proxy_only:
+        os.environ["NQT_PROXY_ONLY"] = "1"
+
+    if args.indices:
+        backfill_indices(start_date=args.start, force=args.force)
+        return
 
     if args.scrape:
         scrape_db(days=args.days, symbol=args.symbol)
